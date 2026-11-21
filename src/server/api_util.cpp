@@ -127,7 +127,7 @@ nlohmann::json result_info(const Request &req, const Result &r) {
     nlohmann::json j = {{"seed", req.seed},
                         {"width", req.width},
                         {"height", req.height},
-                        {"size", req.width},
+                        {"size", std::to_string(req.width) + "x" + std::to_string(req.height)},
                         {"task", task_name(req.task)},
                         {"loras", loras},
                         {"truncated", r.truncated},

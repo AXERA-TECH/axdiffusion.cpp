@@ -52,7 +52,7 @@ section{padding:18px 20px;overflow:auto}
 <aside>
   <div><label for="prompt">提示词</label><textarea id="prompt" placeholder="A photograph of an orange tabby cat sitting on a wooden windowsill in soft afternoon light"></textarea></div>
   <div class="row">
-    <div><label for="size">尺寸</label><select id="size"><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option></select></div>
+    <div><label for="size">尺寸</label><select id="size"><option value="1024x1024">1024 × 1024</option><option value="2048x2048">2048 × 2048</option></select></div>
     <div><label for="n">张数</label><select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
   </div>
   <div><label for="seed">种子</label><input id="seed" type="number" min="0" value="42"><div class="check"><input type="checkbox" id="rand"><span>每次随机</span></div></div>
@@ -74,11 +74,11 @@ async function health(){
   try{
     const h = await (await fetch('/health')).json();
     $('#model').textContent = h.model || '';
-    const sel = $('#size'), want = (h.sizes || []).map(s => s.split('x')[0]);
+    const sel = $('#size'), want = h.sizes || [];
     if (want.length && want.join() !== [...sel.options].map(o => o.value).join()) {
-      const keep = sel.value;
-      sel.innerHTML = want.map(v => `<option value="${v}">${v} × ${v}</option>`).join('');
-      sel.value = want.includes(keep) ? keep : (want.includes('1024') ? '1024' : want[0]);
+      const keep = sel.value, mp = v => { const [w, hh] = v.split('x').map(Number); return (w * hh / 1048576).toFixed(1); };
+      sel.innerHTML = want.map(v => `<option value="${v}">${v.replace('x', ' × ')}（${mp(v)} MP）</option>`).join('');
+      sel.value = want.includes(keep) ? keep : (want.includes('1024x1024') ? '1024x1024' : want[0]);
     }
     $('#refs').disabled = !(h.tasks || []).includes('edit');
     $('#status').textContent = `就绪 · 已出图 ${h.requests} 张 · 排队 ${h.queued} · NPU 内存 ${h.cmm_used_gib.toFixed(1)} GiB`;
@@ -116,7 +116,7 @@ function addCard(b64, prompt, info, loras){
   const m = document.createElement('div'); m.className='meta';
   const s = info && info.seconds ? info.seconds : {};
   const lt = loras.length ? ' · LoRA ' + loras.map(l=>`${l.name}@${l.scale}`).join(', ') : '';
-  m.innerHTML = `<div class="p"></div>种子 ${info?info.seed:'-'} · ${info?info.size:''}² · 总 ${(s.total||0).toFixed(1)}s（DiT ${(s.dit||0).toFixed(1)}s）${lt}<br>`;
+  m.innerHTML = `<div class="p"></div>种子 ${info?info.seed:'-'} · ${info?(info.width+'×'+info.height):''} · 总 ${(s.total||0).toFixed(1)}s（DiT ${(s.dit||0).toFixed(1)}s）${lt}<br>`;
   m.querySelector('.p').textContent = prompt;
   const a = document.createElement('a'); a.href=url; a.download=`axdiffusion_${info?info.seed:Date.now()}.png`; a.textContent='下载'; m.appendChild(a);
   const r = document.createElement('a'); r.href='#'; r.textContent='用此种子'; r.onclick=e=>{e.preventDefault(); $('#seed').value=info.seed; $('#rand').checked=false;}; m.appendChild(r);
@@ -144,7 +144,7 @@ async function runOne(body){
 $('#go').onclick = async () => {
   const prompt = $('#prompt').value.trim();
   if(!prompt){ $('#state').innerHTML='<span class="err">请先输入提示词</span>'; return; }
-  const loras = selectedLoras(), n = parseInt($('#n').value), size = parseInt($('#size').value);
+  const loras = selectedLoras(), n = parseInt($('#n').value), [sw, sh] = $('#size').value.split('x').map(Number);
   const files = [...$('#refs').files];
   $('#go').disabled = true;
   const t0 = performance.now();
@@ -152,7 +152,7 @@ $('#go').onclick = async () => {
     const images = await Promise.all(files.map(toB64));
     for(let i = 0; i < n; i++){
       const seed = $('#rand').checked ? Math.floor(Math.random()*4294967295) : parseInt($('#seed').value||'0') + i;
-      const j = await runOne({task: images.length ? 'edit' : 'txt2img', prompt, width:size, height:size, seed, loras, images});
+      const j = await runOne({task: images.length ? 'edit' : 'txt2img', prompt, width:sw, height:sh, seed, loras, images});
       j.images.forEach(b64=>addCard(b64, prompt, Object.assign({}, j.info, {seconds: j.info.seconds}), loras));
     }
     $('#state').textContent = `完成，用时 ${((performance.now()-t0)/1000).toFixed(1)} 秒`;

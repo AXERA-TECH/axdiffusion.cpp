@@ -24,7 +24,7 @@
 {
   "created": 1795240000,
   "data": [{"b64_json": "iVBORw0...", "revised_prompt": "..."}],
-  "info": [{"seed": 42, "size": 1024, "tokens": 51, "loras": [], "lora_build_s": 0.0,
+  "info": [{"seed": 42, "size": "1024x1024", "width": 1024, "height": 1024, "tokens": 51, "loras": [], "lora_build_s": 0.0,
             "seconds": {"text_encoder": 0.17, "dit": 5.56, "vae": 0.64, "total": 6.38}}]
 }
 ```

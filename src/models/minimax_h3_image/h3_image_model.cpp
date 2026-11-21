@@ -1,5 +1,6 @@
 // MiniMax-H3-Image plugin: tokenizer -> Qwen3-VL text encoder (NPU) -> H3 DiT (NPU) -> image VAE (NPU).
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 
@@ -95,28 +96,40 @@ public:
         i.name = "minimax-h3-image";
         i.tasks = {Task::txt2img};
         if (edit_ready()) i.tasks.push_back(Task::edit);
-        for (int sz : supported_sizes()) i.sizes.push_back({sz, sz});
-        i.max_prompt_tokens = std::min(text_->max_tokens(), dit_->max_text_rows(64 * 64 / 4));
+        for (auto &wh : preset_sizes()) i.sizes.push_back({wh[0], wh[1]});
+        i.max_prompt_tokens = std::min(text_->max_tokens(), dit_->max_text_rows(image_rows(1024, 1024)));
         i.max_references = edit_ready() ? 3 : 0;
         i.lora = lora_ != nullptr;
         return i;
     }
 
-    // Square sizes whose image rows fit at least one DiT tier (the manifest decides: 512/1024/2048/4096 ...).
-    std::vector<int> supported_sizes() const {
-        std::vector<int> out;
-        for (int sz : {512, 768, 1024, 1536, 2048, 3072, 4096}) {
-            const int lat = sz / 16;
-            if (dit_->max_text_rows(lat * lat / 4) > 0) out.push_back(sz);
-        }
+    // Image rows of a W x H output (patch 2x2 on the 16x latent).
+    static int image_rows(int w, int h) { return (w / 32) * (h / 32); }
+
+    // Common sizes (aspect ratios x pixel budgets) that the installed DiT tiers cover with a typical
+    // (64-token) prompt; any other W x H (multiples of 32) is accepted when its sequence fits a tier.
+    std::vector<std::array<int, 2>> preset_sizes() const {
+        static const int ratios[][2] = {{1, 1}, {4, 3}, {3, 4}, {3, 2}, {2, 3}, {16, 9}, {9, 16}, {21, 9}, {9, 21}};
+        static const double mpix[] = {0.25, 1.0, 2.0, 4.0, 16.0};
+        std::vector<std::array<int, 2>> out;
+        for (double mp : mpix)
+            for (auto &r : ratios) {
+                const double area = mp * 1024 * 1024;
+                int w = int(std::lround(std::sqrt(area * r[0] / r[1]) / 32.0)) * 32;
+                int h = int(std::lround(std::sqrt(area * r[1] / r[0]) / 32.0)) * 32;
+                if (w < 256 || h < 256) continue;
+                if (dit_->pick_tier(64 + image_rows(w, h), false, 0, false)) out.push_back({w, h});
+            }
         return out;
     }
+
     void check_size(const Request &req) const {
-        auto sizes = supported_sizes();
-        if (req.width == req.height && std::find(sizes.begin(), sizes.end(), req.width) != sizes.end()) return;
-        std::string have;
-        for (int sz : sizes) have += " " + std::to_string(sz) + "x" + std::to_string(sz);
-        fail("unsupported size " + std::to_string(req.width) + "x" + std::to_string(req.height) + " (supported:" + have + ")");
+        if (req.width % 32 || req.height % 32 || req.width < 256 || req.height < 256)
+            fail("width and height must be multiples of 32 and at least 256 (got " + std::to_string(req.width) + "x" +
+                 std::to_string(req.height) + ")");
+        if (dit_->max_text_rows(image_rows(req.width, req.height)) <= 0)
+            fail("no DiT kernel tier covers " + std::to_string(req.width) + "x" + std::to_string(req.height) +
+                 " (see GET /health sizes for covered presets)");
     }
 
     std::vector<std::string> loras() const override { return lora_ ? lora_->available() : std::vector<std::string>{}; }
@@ -155,8 +168,8 @@ public:
         double t0 = now_s();
         r.token_ids = tok_->encode(req.prompt);
         if (r.token_ids.empty()) fail("prompt produced no tokens");
-        const int lat0 = req.width / 16;
-        const int max_text = std::min(text_->max_tokens(), dit_->max_text_rows(lat0 * lat0 / 4, lora ? lora->rank : 0));
+        const int max_text =
+            std::min(text_->max_tokens(), dit_->max_text_rows(image_rows(req.width, req.height), lora ? lora->rank : 0));
         if (max_text <= 0) fail("no DiT kernel tier for this resolution");
         if (r.token_ids.size() > size_t(max_text)) {
             r.token_ids.resize(max_text);
@@ -168,27 +181,28 @@ public:
         r.seconds["text_encoder"] = now_s() - t0;
         dump(req.dump_dir, "text_hidden.bf16", hidden);
 
-        const int lat = req.width / 16;
+        const int lat_h = req.height / 16, lat_w = req.width / 16;
         TorchGenerator gen(req.seed);
-        auto noise = gen.randn(size_t(kLatentChannels) * lat * lat);
-        auto sample = patchify(noise, lat, lat);
+        auto noise = gen.randn(size_t(kLatentChannels) * lat_h * lat_w);
+        auto sample = patchify(noise, lat_h, lat_w);
 
         Dit::Timing dt;
-        dit_->run(hidden, int(r.token_ids.size()), lat, lat, sample, steps, blocks, dt, lora, &progress);
+        dit_->run(hidden, int(r.token_ids.size()), lat_h, lat_w, sample, steps, blocks, dt, lora, &progress);
         r.seconds["dit"] = dt.prepare + dt.steps;
         // wall time per block (with async launches the per-launch host times only cover binding/submission)
         r.metrics["block_mean_s"] = dt.block_seconds.empty() ? 0 : dt.steps / double(dt.block_seconds.size());
         r.metrics["tokens"] = double(r.token_ids.size());
         r.metrics["sequence"] = dit_->used();
         r.metrics["padded"] = dit_->padded();
-        auto latents = unpatchify(sample, lat, lat);
+        auto latents = unpatchify(sample, lat_h, lat_w);
         dump(req.dump_dir, "latents.f32", latents);
 
         progress("vae");
         Image img;
         double vae_s = 0;
-        img.rgb = vae_->decode(latents, lat, lat, vae_s);
-        img.width = img.height = req.width;
+        img.rgb = vae_->decode(latents, lat_h, lat_w, vae_s);
+        img.width = req.width;
+        img.height = req.height;
         r.seconds["vae"] = vae_s;
         r.images.push_back(std::move(img));
         r.seconds["total"] = now_s() - t_all;
@@ -251,8 +265,8 @@ public:
         r.seconds["vae_encode"] = now_s() - t0;
 
         // 2) generator order after the posterior draws: target noise, then one noise per reference
-        const int lat = req.width / 16;
-        auto noise = gen.randn(size_t(kLatentChannels) * lat * lat);
+        const int lat_h = req.height / 16, lat_w = req.width / 16;
+        auto noise = gen.randn(size_t(kLatentChannels) * lat_h * lat_w);
         DitEdit de;
         for (int k = 0; k < n_ref; ++k) {
             auto rn = gen.randn(ref_latents[k].size());
@@ -310,25 +324,26 @@ public:
         // 5) DiT over [text | references | target]
         const int text_rows = int(pres.ids.size());
         de.text_tags = pres.token_tags;
-        auto layout = edit::packed_layout(pres.token_tags, ref_grids, lat, lat);
+        auto layout = edit::packed_layout(pres.token_tags, ref_grids, lat_h, lat_w);
         de.positions = layout.position_ids;
-        auto sample = patchify(noise, lat, lat);
+        auto sample = patchify(noise, lat_h, lat_w);
         Dit::Timing dt;
-        dit_->run(hidden, text_rows, lat, lat, sample, steps, blocks, dt, nullptr, &progress, &de);
+        dit_->run(hidden, text_rows, lat_h, lat_w, sample, steps, blocks, dt, nullptr, &progress, &de);
         r.seconds["dit"] = dt.prepare + dt.steps;
         r.metrics["tokens"] = double(text_rows);
         r.metrics["references"] = double(n_ref);
         r.metrics["sequence"] = dit_->used();
         r.metrics["padded"] = dit_->padded();
-        auto latents = unpatchify(sample, lat, lat);
+        auto latents = unpatchify(sample, lat_h, lat_w);
         dump(req.dump_dir, "latents.f32", latents);
 
         // 6) decode
         progress("vae");
         Image img;
         double vae_s = 0;
-        img.rgb = vae_->decode(latents, lat, lat, vae_s);
-        img.width = img.height = req.width;
+        img.rgb = vae_->decode(latents, lat_h, lat_w, vae_s);
+        img.width = req.width;
+        img.height = req.height;
         r.seconds["vae"] = vae_s;
         r.images.push_back(std::move(img));
         r.seconds["total"] = now_s() - t_all;

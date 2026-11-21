@@ -90,6 +90,29 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
 
 Dit::~Dit() = default;
 
+int Dit::pick_tier(int used, bool static_ok, int lora_rank, bool edit, bool *is_static) const {
+    const std::map<int, std::unique_ptr<Model>> *cands = &block_;
+    if (edit) {
+        cands = &edit_block_;
+    } else if (lora_rank) {
+        auto it = lora_block_.find(lora_rank);
+        if (it == lora_block_.end()) return 0;
+        cands = &it->second;
+    }
+    const auto &finals = edit ? edit_final_ : final_;
+    for (auto &kv : *cands) {
+        const int P = kv.first;
+        if (P < used || !finals.count(P)) continue;
+        const Model *m = kv.second.get();
+        const bool runtime = m->has_input("sequence_bounds");
+        if (runtime ? P - granule_.at(m) < used : static_ok) {
+            if (is_static) *is_static = !runtime;
+            return P;
+        }
+    }
+    return 0;
+}
+
 int Dit::max_text_rows(int image_rows, int lora_rank) const {
     const std::map<int, std::unique_ptr<Model>> *cands = &block_;
     if (lora_rank) {
@@ -183,28 +206,15 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     const bool fast = latent_h == 64 && latent_w == 64 && text_rows == 51;
     if (lora && !lora_block_.count(lora->rank))
         fail("no rank-" + std::to_string(lora->rank) + " LoRA block kernels in this model directory");
-    // smallest tier whose kernel (LoRA variant when a LoRA set is active) accepts this sequence
-    const auto &cands = edit ? edit_block_ : lora ? lora_block_.at(lora->rank) : block_;
-    const auto &finals = edit ? edit_final_ : final_;
-    padded_ = 0;
     static_ = false;
-    for (auto &kv : cands) {
-        const int P = kv.first;
-        if (P < used_ || !finals.count(P)) continue;
-        const Model *m = kv.second.get();
-        const bool runtime = m->has_input("sequence_bounds");
-        if (runtime ? P - granule_.at(m) < used_ : fast) {
-            padded_ = P;
-            static_ = !runtime;
-            break;
-        }
-    }
+    padded_ = pick_tier(used_, fast, lora ? lora->rank : 0, edit != nullptr, &static_);
+    const auto &cands = edit ? edit_block_ : lora ? lora_block_.at(lora->rank) : block_;
     if (!padded_) {
         std::string have;
         for (auto &kv : cands) have += " " + std::to_string(kv.first);
         fail("no DiT kernel tier for a " + std::to_string(used_) + "-token sequence" +
              (lora ? " with a rank-" + std::to_string(lora->rank) + " LoRA" : std::string()) + " (available:" + have +
-             "); the prompt is too long for this resolution");
+             "); a runtime tier accepts (padded - granule, padded] rows: pick a size/prompt that lands in one");
     }
     text_rows_ = text_rows;
 

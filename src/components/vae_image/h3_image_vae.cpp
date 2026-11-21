@@ -192,27 +192,27 @@ std::vector<uint8_t> Vae::decode(const std::vector<float> &latents, int h, int w
     split_tiles(H, ys, yo);
     split_tiles(W, xs, xo);
     const int ny = int(ys.size()), nx = int(xs.size());
-    // decode every tile (rows grouped by 5 where possible)
-    std::vector<std::vector<float>> tiles(size_t(ny) * nx);  // each [3,256,256]
-    for (int iy = 0; iy < ny; ++iy) {
-        for (int ix = 0; ix < nx;) {
-            int n = (nx - ix >= 5) ? 5 : 1;
-            std::vector<uint16_t> tok(size_t(n) * 256 * kLatentChannels);
-            for (int t = 0; t < n; ++t) {
-                int ly = ys[iy] / kRatio, lx = xs[ix + t] / kRatio;
-                for (int y = 0; y < kTileLatent; ++y)
-                    for (int x = 0; x < kTileLatent; ++x)
-                        for (int c = 0; c < kLatentChannels; ++c)
-                            tok[(size_t(t) * 256 + y * 16 + x) * kLatentChannels + c] =
-                                f32_to_bf16(z[(size_t(c) * h + ly + y) * w + lx + x]);
-            }
-            std::vector<float> px;
-            decode_tiles(tok, n, px);
-            for (int t = 0; t < n; ++t)
-                tiles[size_t(iy) * nx + ix + t].assign(px.begin() + long(t) * 3 * kTile * kTile,
-                                                       px.begin() + long(t + 1) * 3 * kTile * kTile);
-            ix += n;
+    // decode every tile, batched by 5 across the whole grid (row-major), the remainder one by one
+    const int total = ny * nx;
+    std::vector<std::vector<float>> tiles(static_cast<size_t>(total));  // each [3,256,256]
+    for (int t0 = 0; t0 < total;) {
+        const int n = (total - t0 >= 5) ? 5 : 1;
+        std::vector<uint16_t> tok(size_t(n) * 256 * kLatentChannels);
+        for (int t = 0; t < n; ++t) {
+            const int iy = (t0 + t) / nx, ix = (t0 + t) % nx;
+            const int ly = ys[iy] / kRatio, lx = xs[ix] / kRatio;
+            for (int y = 0; y < kTileLatent; ++y)
+                for (int x = 0; x < kTileLatent; ++x)
+                    for (int c = 0; c < kLatentChannels; ++c)
+                        tok[(size_t(t) * 256 + y * 16 + x) * kLatentChannels + c] =
+                            f32_to_bf16(z[(size_t(c) * h + ly + y) * w + lx + x]);
         }
+        std::vector<float> px;
+        decode_tiles(tok, n, px);
+        for (int t = 0; t < n; ++t)
+            tiles[size_t(t0 + t)].assign(px.begin() + long(t) * 3 * kTile * kTile,
+                                         px.begin() + long(t + 1) * 3 * kTile * kTile);
+        t0 += n;
     }
     // Blend overlaps against the original (unblended) neighbours, then crop each tile's trailing overlap.
     std::vector<float> img(size_t(3) * H * W, 0.f);

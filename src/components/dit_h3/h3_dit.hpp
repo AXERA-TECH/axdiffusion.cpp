@@ -78,6 +78,9 @@ public:
     std::vector<int> lora_ranks() const;  // rank tiers that have LoRA block kernels
     // Longest text (rows) any runtime tier accepts next to `image_rows` image rows (LoRA rank tier if rank > 0).
     int max_text_rows(int image_rows, int lora_rank = 0) const;
+    // Smallest tier whose kernel accepts `used` rows (0 = none). static_ok: the request matches the static
+    // kernels' geometry (1024x1024, 51 text rows). lora_rank 0 = base kernels.
+    int pick_tier(int used, bool static_ok, int lora_rank, bool edit, bool *is_static = nullptr) const;
     int used() const { return used_; }
     int padded() const { return padded_; }
 
