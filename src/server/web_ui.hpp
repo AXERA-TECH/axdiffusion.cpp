@@ -52,9 +52,14 @@ section{padding:18px 20px;overflow:auto}
 <aside>
   <div><label for="prompt">提示词</label><textarea id="prompt" placeholder="A photograph of an orange tabby cat sitting on a wooden windowsill in soft afternoon light"></textarea></div>
   <div class="row">
-    <div><label for="size">尺寸</label><select id="size"><option value="1024x1024">1024 × 1024</option><option value="2048x2048">2048 × 2048</option></select></div>
+    <div><label for="size">尺寸</label><select id="size"><option value="1024x1024">1024 × 1024</option><option value="2048x2048">2048 × 2048</option><option value="custom">自定义…</option></select></div>
     <div><label for="n">张数</label><select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
   </div>
+  <div class="row" id="customSize" style="display:none">
+    <div><label for="cw">宽</label><input id="cw" type="number" min="256" step="32" value="1344"></div>
+    <div><label for="ch">高</label><input id="ch" type="number" min="256" step="32" value="768"></div>
+  </div>
+  <div class="small" id="sizeHint" style="display:none"></div>
   <div><label for="seed">种子</label><input id="seed" type="number" min="0" value="42"><div class="check"><input type="checkbox" id="rand"><span>每次随机</span></div></div>
   <div><label>LoRA</label><div id="loras"></div><button id="addLora" type="button">+ 添加 LoRA</button> <span class="small" id="loraHint"></span></div>
   <div><label for="refs">参考图（编辑，可选）</label><input id="refs" type="file" accept="image/*" multiple><div class="refs" id="refPrev"></div></div>
@@ -70,6 +75,23 @@ section{padding:18px 20px;overflow:auto}
 <script>
 const $ = s => document.querySelector(s);
 let loraNames = [];
+// Custom sizes: both sides rounded to a multiple of 32 (>= 256). The server answers with an error when the
+// sequence (text + (W/32)*(H/32) image rows) falls between the installed kernel tiers.
+const r32 = v => Math.max(256, Math.round((parseInt(v) || 0) / 32) * 32);
+function chosenSize(){
+  const v = $('#size').value;
+  if (v !== 'custom') return v.split('x').map(Number);
+  return [r32($('#cw').value), r32($('#ch').value)];
+}
+function sizeUi(){
+  const custom = $('#size').value === 'custom';
+  $('#customSize').style.display = custom ? '' : 'none';
+  $('#sizeHint').style.display = custom ? '' : 'none';
+  if (custom) {
+    const [w, h] = chosenSize();
+    $('#sizeHint').textContent = `实际 ${w} × ${h}（${(w * h / 1048576).toFixed(2)} MP，图像 ${(w / 32) * (h / 32)} 行；宽高取 32 的倍数）`;
+  }
+}
 async function health(){
   try{
     const h = await (await fetch('/health')).json();
@@ -77,8 +99,9 @@ async function health(){
     const sel = $('#size'), want = h.sizes || [];
     if (want.length && want.join() !== [...sel.options].map(o => o.value).join()) {
       const keep = sel.value, mp = v => { const [w, hh] = v.split('x').map(Number); return (w * hh / 1048576).toFixed(1); };
-      sel.innerHTML = want.map(v => `<option value="${v}">${v.replace('x', ' × ')}（${mp(v)} MP）</option>`).join('');
-      sel.value = want.includes(keep) ? keep : (want.includes('1024x1024') ? '1024x1024' : want[0]);
+      sel.innerHTML = want.map(v => `<option value="${v}">${v.replace('x', ' × ')}（${mp(v)} MP）</option>`).join('') +
+        '<option value="custom">自定义…</option>';
+      sel.value = (want.includes(keep) || keep === 'custom') ? keep : (want.includes('1024x1024') ? '1024x1024' : want[0]);
     }
     $('#refs').disabled = !(h.tasks || []).includes('edit');
     $('#status').textContent = `就绪 · 已出图 ${h.requests} 张 · 排队 ${h.queued} · NPU 内存 ${h.cmm_used_gib.toFixed(1)} GiB`;
@@ -144,7 +167,7 @@ async function runOne(body){
 $('#go').onclick = async () => {
   const prompt = $('#prompt').value.trim();
   if(!prompt){ $('#state').innerHTML='<span class="err">请先输入提示词</span>'; return; }
-  const loras = selectedLoras(), n = parseInt($('#n').value), [sw, sh] = $('#size').value.split('x').map(Number);
+  const loras = selectedLoras(), n = parseInt($('#n').value), [sw, sh] = chosenSize();
   const files = [...$('#refs').files];
   $('#go').disabled = true;
   const t0 = performance.now();
@@ -164,6 +187,7 @@ $('#go').onclick = async () => {
 };
 document.addEventListener('keydown', e=>{ if((e.ctrlKey||e.metaKey) && e.key==='Enter') $('#go').click(); });
 health(); loadLoras(); setInterval(health, 15000);
+$('#size').addEventListener('change', sizeUi); $('#cw').addEventListener('input', sizeUi); $('#ch').addEventListener('input', sizeUi);
 </script>
 </body>
 </html>
