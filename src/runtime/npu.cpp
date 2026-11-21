@@ -1,6 +1,9 @@
 #include "npu.hpp"
 
 #include <algorithm>
+#include <sys/stat.h>
+
+#include <cstdio>
 #include <cstring>
 
 #include "axcl.h"
@@ -151,7 +154,30 @@ Buf TensorBank::get(const std::string &name) const {
 
 // ---------------------------------------------------------------- Model
 Model::Model(const std::string &path) : path_(path) {
-    check(axclrtEngineLoadFromFile(path.c_str(), &model_id_), "load " + path);
+    // LoadFromFile sends the whole file in one DMA, which the driver rejects for large models (hundreds of MB);
+    // stage large files into device memory in chunks and load from there.
+    struct stat st {};
+    if (stat(path.c_str(), &st) != 0) fail("model file not found: " + path);
+    const size_t bytes = size_t(st.st_size);
+    if (bytes <= (64u << 20)) {
+        check(axclrtEngineLoadFromFile(path.c_str(), &model_id_), "load " + path);
+    } else {
+        std::FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) fail("cannot open " + path);
+        DeviceBuffer staging(bytes, "model-staging");
+        std::vector<uint8_t> chunk(kCopyChunk);
+        for (size_t done = 0; done < bytes;) {
+            size_t n = std::min(kCopyChunk, bytes - done);
+            if (std::fread(chunk.data(), 1, n, f) != n) {
+                std::fclose(f);
+                fail("short read: " + path);
+            }
+            staging.buf().upload(chunk.data(), n, done);
+            done += n;
+        }
+        std::fclose(f);
+        check(axclrtEngineLoadFromMem(staging.buf().ptr, bytes, &model_id_), "load (from device memory) " + path);
+    }
     check(axclrtEngineCreateContext(model_id_, &context_id_), "CreateContext " + path);
     axclrtEngineIOInfo info = nullptr;
     check(axclrtEngineGetIOInfo(model_id_, &info), "GetIOInfo " + path);
@@ -180,6 +206,18 @@ bool Model::has_input(const std::string &name) const {
     return false;
 }
 
+std::vector<std::string> Model::input_names() const {
+    std::vector<std::string> v;
+    for (auto &i : inputs_) v.push_back(i.name);
+    return v;
+}
+
+std::vector<std::string> Model::output_names() const {
+    std::vector<std::string> v;
+    for (auto &o : outputs_) v.push_back(o.name);
+    return v;
+}
+
 std::string Model::describe() const {
     std::string s = path_ + "\n  inputs:";
     for (auto &i : inputs_) s += " " + i.name + "(" + std::to_string(i.size) + ")";
@@ -188,7 +226,7 @@ std::string Model::describe() const {
     return s;
 }
 
-void Model::run(const Bindings &inputs, const Bindings &outputs) {
+void Model::bind(const Bindings &inputs, const Bindings &outputs) {
     for (auto &in : inputs_) {
         auto it = inputs.find(in.name);
         if (it == inputs.end() || !it->second) fail(path_ + ": input '" + in.name + "' is not bound");
@@ -204,7 +242,33 @@ void Model::run(const Bindings &inputs, const Bindings &outputs) {
         if (b.size < out.size) fail(path_ + ": output '" + out.name + "' buffer too small");
         check(axclrtEngineSetOutputBufferByName(io_, out.name.c_str(), b.ptr, out.size), "bind output " + out.name);
     }
+}
+
+void Model::run(const Bindings &inputs, const Bindings &outputs) {
+    bind(inputs, outputs);
     check(axclrtEngineExecute(model_id_, context_id_, 0, io_), "Execute " + path_);
 }
+
+void Model::submit(Stream &stream, const Bindings &inputs, const Bindings &outputs) {
+    bind(inputs, outputs);
+    check(axclrtEngineExecuteAsync(model_id_, context_id_, 0, io_, axclrtStream(stream.handle())),
+          "ExecuteAsync " + path_);
+}
+
+// ---------------------------------------------------------------- Stream
+Stream::Stream() {
+    axclrtStream s = nullptr;
+    check(axclrtCreateStream(&s), "axclrtCreateStream");
+    s_ = s;
+}
+
+Stream::~Stream() {
+    if (s_) {
+        axclrtSynchronizeStream(axclrtStream(s_));
+        axclrtDestroyStream(axclrtStream(s_));
+    }
+}
+
+void Stream::sync() { check(axclrtSynchronizeStream(axclrtStream(s_)), "axclrtSynchronizeStream"); }
 
 }  // namespace axd

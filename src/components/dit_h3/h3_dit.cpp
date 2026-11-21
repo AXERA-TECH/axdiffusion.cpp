@@ -4,6 +4,7 @@
 #include "common.hpp"
 #include "h3_dit.hpp"
 #include "lora.hpp"
+#include <cstdlib>
 #include "safetensors.hpp"
 
 namespace axd {
@@ -56,6 +57,7 @@ struct RefinerWs {
 };
 
 Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
+    if (const char *e = std::getenv("AXD_SYNC")) async_ = std::string(e) != "1";
     // Sequence tiers come from the model directory's manifest ("... padded N ..."), so new tiers
     // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
     auto load = [&](const std::string &purpose, std::map<int, std::unique_ptr<Model>> &into) {
@@ -66,6 +68,8 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
         }
     };
     load("dit-block", block_);
+    load("dit-block-edit", edit_block_);
+    for (auto &kv : dir.tiers("dit-final-edit", "padded ")) edit_final_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : dir.tiers("dit-final", "padded ")) final_[kv.first] = std::make_unique<Model>(kv.second);
     // LoRA block kernels per rank tier: "dit-block-lora" is rank 64, "dit-block-lora-rN" is rank N.
     load("dit-block-lora", lora_block_[64]);
@@ -86,6 +90,19 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
 
 Dit::~Dit() = default;
 
+int Dit::max_text_rows(int image_rows, int lora_rank) const {
+    const std::map<int, std::unique_ptr<Model>> *cands = &block_;
+    if (lora_rank) {
+        auto it = lora_block_.find(lora_rank);
+        if (it == lora_block_.end()) return 0;
+        cands = &it->second;
+    }
+    int best = 0;
+    for (auto &kv : *cands)
+        if (final_.count(kv.first) && kv.second->has_input("sequence_bounds")) best = std::max(best, kv.first - image_rows);
+    return best;
+}
+
 std::vector<int> Dit::lora_ranks() const {
     std::vector<int> out;
     for (auto &kv : lora_block_)
@@ -104,7 +121,7 @@ DitShape &Dit::shape(int padded) {
     s->attention_output = DeviceBuffer(padded * row, "dit-attn-out");
     s->residual = DeviceBuffer(padded * row, "dit-residual");
     s->ffn = DeviceBuffer(size_t(padded) * kDitFfn * 2, "dit-ffn");
-    s->adaln_ws = DeviceBuffer(size_t(3) * 6 * kDitHidden * 2, "dit-adaln-ws");
+    s->adaln_ws = DeviceBuffer(size_t(2) * 3 * 6 * kDitHidden * 2, "dit-adaln-ws");  // M=2 edit size
     s->mlp_ws = DeviceBuffer(padded * row, "dit-mlp-ws");
     s->k_ws = DeviceBuffer(kv, "dit-k-ws");
     s->v_ws = DeviceBuffer(kv, "dit-v-ws");
@@ -112,7 +129,7 @@ DitShape &Dit::shape(int padded) {
     s->q_ws = DeviceBuffer(kv, "dit-q-ws");
     s->video = DeviceBuffer(size_t(padded) * kPatchDim * 2, "dit-video");
     s->inverse = DeviceBuffer(size_t(padded) * 4, "dit-inverse");
-    s->final_ws = DeviceBuffer(size_t(2) * kDitHidden * 2, "dit-final-ws");
+    s->final_ws = DeviceBuffer(size_t(2) * 2 * kDitHidden * 2, "dit-final-ws");  // M=2 edit size
     s->combined = DeviceBuffer(size_t(padded) * 4, "dit-combined");
     s->rope = DeviceBuffer(size_t(padded) * 96 * 2, "dit-rope");
     s->positions = DeviceBuffer(size_t(padded) * 8 * 4, "dit-positions");
@@ -145,26 +162,35 @@ RefinerWs &Dit::refiner_ws(int rows) {
     r->attn_ws = DeviceBuffer(kv, "ref-attn-ws");
     r->q_ws = DeviceBuffer(kv, "ref-q");
     r->normalized = DeviceBuffer(rows * row, "ref-normalized");
-    if (rows == 512) r->bounds = DeviceBuffer(12, "ref-bounds");
+    if (refiner_.at(rows)->has_input("sequence_bounds")) r->bounds = DeviceBuffer(12, "ref-bounds");
     slot = std::move(r);
     return *slot;
 }
 
 void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
-                  const LoraSet *lora) {
+                  const LoraSet *lora, const DitEdit *edit) {
+    edit_ = edit != nullptr;
     image_tokens_ = (latent_h / 2) * (latent_w / 2);
-    used_ = text_rows + image_tokens_;
+    reference_rows_ = edit ? int(edit->reference_rows.size() / kPatchDim) : 0;
+    used_ = text_rows + reference_rows_ + image_tokens_;
+    if (edit) {
+        if (!supports_edit()) fail("this model directory has no reference-edit DiT kernels");
+        if (lora) fail("LoRA is not supported together with reference editing yet");
+        if (int(edit->text_tags.size()) != text_rows || int(edit->positions.size()) != used_)
+            fail("edit layout does not match the sequence");
+    }
     // static kernels are compiled for exactly this geometry
     const bool fast = latent_h == 64 && latent_w == 64 && text_rows == 51;
     if (lora && !lora_block_.count(lora->rank))
         fail("no rank-" + std::to_string(lora->rank) + " LoRA block kernels in this model directory");
     // smallest tier whose kernel (LoRA variant when a LoRA set is active) accepts this sequence
-    const auto &cands = lora ? lora_block_.at(lora->rank) : block_;
+    const auto &cands = edit ? edit_block_ : lora ? lora_block_.at(lora->rank) : block_;
+    const auto &finals = edit ? edit_final_ : final_;
     padded_ = 0;
     static_ = false;
     for (auto &kv : cands) {
         const int P = kv.first;
-        if (P < used_ || !final_.count(P)) continue;
+        if (P < used_ || !finals.count(P)) continue;
         const Model *m = kv.second.get();
         const bool runtime = m->has_input("sequence_bounds");
         if (runtime ? P - granule_.at(m) < used_ : fast) {
@@ -191,8 +217,9 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     // 2) token refiner (2 layers) + RMSNorm on the NPU
     int rows = 0;
     if (static_ && refiner_.count(64)) rows = 64;  // static 64-row refiner pairs with the static block kernel
+    // runtime refiner kernels accept (rows - 512, rows] valid text rows
     for (auto it = refiner_.begin(); !rows && it != refiner_.end(); ++it)
-        if (it->first >= text_rows && it->first != 64) rows = it->first;
+        if (it->first >= text_rows && it->first != 64 && it->first - 512 < text_rows) rows = it->first;
     if (!rows) fail("no token refiner tier for " + std::to_string(text_rows) + " text rows");
     auto &r = refiner_ws(rows);
     r.x[0].buf().fill_zero();
@@ -245,7 +272,9 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     std::vector<uint16_t> rope(size_t(padded_) * 96, 0);
     for (int t = 0; t < used_; ++t) {
         float p[3];
-        if (t < text_rows) {
+        if (edit) {
+            for (int a = 0; a < 3; ++a) p[a] = float(edit->positions[t][a]);
+        } else if (t < text_rows) {
             p[0] = float(t), p[1] = 0.f, p[2] = 0.f;
         } else {
             int i = t - text_rows, hh = i / (latent_w / 2), ww = i % (latent_w / 2);
@@ -259,9 +288,22 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
             }
     }
     s.rope.buf().upload(rope.data(), rope.size() * 2);
+    // AdaLN row per token: timestep_index * 3 + tag (text 1 / vision-block 0 / image 0; references use 0.999 = index 1)
     std::vector<uint32_t> combined(padded_, 0);
-    for (int i = 0; i < text_rows; ++i) combined[i] = 1;
+    std::vector<int32_t> inverse(padded_, 0);
+    for (int i = 0; i < text_rows; ++i) combined[i] = edit ? uint32_t(edit->text_tags[i]) : 1u;
+    for (int i = 0; i < reference_rows_; ++i) {
+        combined[text_rows + i] = 3;
+        inverse[text_rows + i] = 1;
+    }
     s.combined.buf().upload(combined.data(), combined.size() * 4);
+    s.inverse.buf().upload(inverse.data(), inverse.size() * 4);
+    reference_proj_.clear();
+    if (reference_rows_) {
+        reference_proj_.resize(size_t(reference_rows_) * kDitHidden);
+        host_linear(edit->reference_rows.data(), reference_rows_, kPatchDim, w_.proj_in_w, w_.proj_in_b, kDitHidden,
+                    reference_proj_.data());
+    }
     if (s.bounds.size()) {
         int32_t b[3] = {0, used_, padded_};
         s.bounds.buf().upload(b, sizeof(b));
@@ -272,13 +314,15 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
 
 void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const LoraSet *lora) {
     auto &s = shape(padded_);
+    if (async_ && !stream_) stream_ = std::make_unique<Stream>();  // created on the NPU worker thread
     const size_t row = size_t(kDitHidden) * 2;
     // image rows: patch projection 96 -> 5376 on the host
     std::vector<uint16_t> image(size_t(image_tokens_) * kDitHidden);
     host_linear(sample.data(), image_tokens_, kPatchDim, w_.proj_in_w, w_.proj_in_b, kDitHidden, image.data());
     Buf x0 = s.x[0];
     x0.copy_from(refined_text_, refined_text_.size, 0, 0);
-    x0.upload(image.data(), image.size() * 2, size_t(text_rows_) * row);
+    if (reference_rows_) x0.upload(reference_proj_.data(), reference_proj_.size() * 2, size_t(text_rows_) * row);
+    x0.upload(image.data(), image.size() * 2, size_t(text_rows_ + reference_rows_) * row);
     if (size_t(used_) * row < x0.size) x0.view(size_t(used_) * row, x0.size - size_t(used_) * row).fill_zero();
 
     auto &bank_shared = *w_.shared;
@@ -287,16 +331,16 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
         double t0 = now_s();
         auto &b = *w_.blocks[l];
         Bindings in = {{"x", s.x[cur]},
-                       {"adaln_input", w_.adaln_input(si)},
+                       {"adaln_input", w_.adaln_input(si, edit_)},
                        {"combined_indices", s.combined},
                        {"norm1_weight", b.get("norm1")},
                        {"norm2_weight", b.get("norm2")},
-                       {"shift_msa_input", w_.adaln_slot(si, l, 0)},
-                       {"scale_msa_input", w_.adaln_slot(si, l, 1)},
-                       {"gate_msa_input", w_.adaln_slot(si, l, 2)},
-                       {"shift_mlp_input", w_.adaln_slot(si, l, 3)},
-                       {"scale_mlp_input", w_.adaln_slot(si, l, 4)},
-                       {"gate_mlp_input", w_.adaln_slot(si, l, 5)},
+                       {"shift_msa_input", w_.adaln_slot(si, l, 0, edit_)},
+                       {"scale_msa_input", w_.adaln_slot(si, l, 1, edit_)},
+                       {"gate_msa_input", w_.adaln_slot(si, l, 2, edit_)},
+                       {"shift_mlp_input", w_.adaln_slot(si, l, 3, edit_)},
+                       {"scale_mlp_input", w_.adaln_slot(si, l, 4, edit_)},
+                       {"gate_mlp_input", w_.adaln_slot(si, l, 5, edit_)},
                        {"qkv_weight", b.get("qkv.payload")},
                        {"qkv_scale", b.get("qkv.scale")},
                        {"qkv_scale2", b.get("qkv.scale2")},
@@ -323,41 +367,56 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
                        {"attention_workspace", s.attn_ws},
                        {"q_workspace", s.q_ws}};
         if (s.bounds.size()) in["sequence_bounds"] = s.bounds;
-        Model *model = block_[padded_].get();
+        Model *model = edit_ ? edit_block_.at(padded_).get() : block_[padded_].get();
         if (lora) {
             model = lora_block_[lora->rank][padded_].get();
             const auto &ab = lora->block_ab[l];
             for (int k = 0; k < 8; ++k) in[kLoraInputs[k]] = ab[k];
         }
-        model->run(in, {{"output", s.x[1 - cur]},
-                                  {"attention_output", s.attention_output},
-                                  {"residual_workspace", s.residual},
-                                  {"ffn_workspace", s.ffn}});
+        const Bindings outs = {{"output", s.x[1 - cur]},
+                               {"attention_output", s.attention_output},
+                               {"residual_workspace", s.residual},
+                               {"ffn_workspace", s.ffn}};
+        if (async_)
+            model->submit(*stream_, in, outs);
+        else
+            model->run(in, outs);
         cur = 1 - cur;
         t.block_seconds.push_back(now_s() - t0);
     }
-    final_[padded_]->run({{"x", s.x[cur]},
+    auto final_run = [&](const Bindings &in, const Bindings &out) {
+        if (async_) {
+            (edit_ ? edit_final_ : final_).at(padded_)->submit(*stream_, in, out);
+            double t0 = now_s();
+            stream_->sync();  // the velocity is read on the host next
+            t.sync_seconds += now_s() - t0;
+        } else {
+            (edit_ ? edit_final_ : final_).at(padded_)->run(in, out);
+        }
+    };
+    final_run({{"x", s.x[cur]},
                           {"inverse_indices", s.inverse},
-                          {"adaln_input", w_.adaln_input(si)},
+                          {"adaln_input", w_.adaln_input(si, edit_)},
                           {"norm_weight", bank_shared.get("final.norm")},
-                          {"shift_input", w_.final_shift(si)},
-                          {"scale_input", w_.final_scale(si)},
+                          {"shift_input", w_.final_shift(si, edit_)},
+                          {"scale_input", w_.final_scale(si, edit_)},
                           {"final_adaln_workspace", s.final_ws},
                           {"video_weight", bank_shared.get("pdd." + std::to_string(si) + ".weight")},
                           {"video_bias", bank_shared.get("pdd." + std::to_string(si) + ".bias")}},
                          {{"video_output", s.video}});
     std::vector<uint16_t> vel(size_t(image_tokens_) * kPatchDim);
-    s.video.buf().download(vel.data(), vel.size() * 2, size_t(text_rows_) * kPatchDim * 2);
+    s.video.buf().download(vel.data(), vel.size() * 2, size_t(text_rows_ + reference_rows_) * kPatchDim * 2);
     const float dt = kSigmas[si] - kSigmas[si + 1];
     for (size_t i = 0; i < vel.size(); ++i) sample[i] += dt * bf16_to_f32(vel[i]);
 }
 
 void Dit::run(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
-              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora, Progress *progress) {
+              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora, Progress *progress,
+              const DitEdit *edit) {
     if (steps < 1 || steps > kSteps) fail("steps must be 1..6");
     if (blocks < 1 || blocks > kDitLayers) fail("blocks must be 1..50");
     double t0 = now_s();
-    prepare(text_hidden, text_rows, latent_h, latent_w, lora);
+    prepare(text_hidden, text_rows, latent_h, latent_w, lora, edit);
     t.prepare = now_s() - t0;
     t0 = now_s();
     for (int i = 0; i < steps; ++i) {
@@ -371,19 +430,23 @@ void Dit::run(const std::vector<uint16_t> &text_hidden, int text_rows, int laten
     t.steps = now_s() - t0;
 }
 
-Buf DitWeights::adaln_slot(int step, int layer, int slot) const {
-    const size_t slot_bytes = 3 * kDitHidden * 2;
+Buf DitWeights::adaln_slot(int step, int layer, int slot, bool edit) const {
+    const int rows = edit ? 6 : 3;
+    const size_t slot_bytes = size_t(rows) * kDitHidden * 2;
     size_t index = (size_t(step) * kDitLayers + layer) * 6 + slot;
-    return adaln_blocks.buf().view(index * slot_bytes, slot_bytes);
+    return (edit ? adaln_edit_blocks : adaln_blocks).buf().view(index * slot_bytes, slot_bytes);
 }
-Buf DitWeights::adaln_input(int step) const {
-    return adaln->get("adaln_input").view(size_t(step) * 2688 * 2, 2688 * 2);
+Buf DitWeights::adaln_input(int step, bool edit) const {
+    const size_t n = size_t(edit ? 2 : 1) * 2688 * 2;
+    return (edit ? *adaln_edit : *adaln).get("adaln_input").view(size_t(step) * n, n);
 }
-Buf DitWeights::final_shift(int step) const {
-    return adaln->get("final_shift").view(size_t(step) * kDitHidden * 2, kDitHidden * 2);
+Buf DitWeights::final_shift(int step, bool edit) const {
+    const size_t n = size_t(edit ? 2 : 1) * kDitHidden * 2;
+    return (edit ? *adaln_edit : *adaln).get("final_shift").view(size_t(step) * n, n);
 }
-Buf DitWeights::final_scale(int step) const {
-    return adaln->get("final_scale").view(size_t(step) * kDitHidden * 2, kDitHidden * 2);
+Buf DitWeights::final_scale(int step, bool edit) const {
+    const size_t n = size_t(edit ? 2 : 1) * kDitHidden * 2;
+    return (edit ? *adaln_edit : *adaln).get("final_scale").view(size_t(step) * n, n);
 }
 
 std::unique_ptr<DitWeights> load_dit_weights(const ModelDir &dir) {
@@ -413,6 +476,20 @@ std::unique_ptr<DitWeights> load_dit_weights(const ModelDir &dir) {
         if (blocks.nbytes != size_t(kSteps) * kDitLayers * 6 * 3 * kDitHidden * 2) fail("unexpected adaln table size");
         w->adaln_blocks = DeviceBuffer(blocks.nbytes, "dit-adaln-blocks");
         w->adaln_blocks.buf().upload(blocks.data, blocks.nbytes);
+    }
+    if (dir.exists("dit/adaln_edit.safetensors")) {
+        SafeTensors st(dir.file("dit/adaln_edit.safetensors"));
+        w->adaln_edit = std::make_unique<TensorBank>("dit-adaln-edit");
+        for (const char *name : {"adaln_input", "final_shift", "final_scale"}) {
+            auto &t = st.get(name);
+            if (t.dtype != "BF16") fail(std::string("adaln_edit ") + name + " must be bf16");
+            w->adaln_edit->add(name, t.data, t.nbytes);
+        }
+        w->adaln_edit->materialize();
+        auto &blocks = st.get("blocks");  // [6,50,6,6,5376] bf16
+        if (blocks.nbytes != size_t(kSteps) * kDitLayers * 6 * 6 * kDitHidden * 2) fail("unexpected adaln_edit size");
+        w->adaln_edit_blocks = DeviceBuffer(blocks.nbytes, "dit-adaln-edit-blocks");
+        w->adaln_edit_blocks.buf().upload(blocks.data, blocks.nbytes);
     }
     for (int i = 0; i < kDitLayers; ++i) {
         char rel[64];

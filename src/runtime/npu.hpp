@@ -91,6 +91,20 @@ private:
 
 using Bindings = std::map<std::string, Buf>;
 
+// An AXCL stream: launches submitted to it run in order; sync() waits for all of them (and reports their errors).
+class Stream {
+public:
+    Stream();
+    ~Stream();
+    Stream(const Stream &) = delete;
+    Stream &operator=(const Stream &) = delete;
+    void sync();
+    void *handle() const { return s_; }
+
+private:
+    void *s_ = nullptr;
+};
+
 // One compiled AXModel with a reusable IO object.
 class Model {
 public:
@@ -103,11 +117,17 @@ public:
     // names are an error) and every output from `outputs` (missing outputs use
     // a private default buffer), then execute synchronously.
     void run(const Bindings &inputs, const Bindings &outputs = {});
+    // Same binding rules, but only submits the launch to `stream` (the bindings are captured at submission, so
+    // the next launch can be bound while this one runs). Buffers must stay valid until stream.sync().
+    void submit(Stream &stream, const Bindings &inputs, const Bindings &outputs = {});
     bool has_input(const std::string &name) const;
+    std::vector<std::string> input_names() const;
+    std::vector<std::string> output_names() const;
     std::string describe() const;
     const std::string &path() const { return path_; }
 
 private:
+    void bind(const Bindings &inputs, const Bindings &outputs);
     struct IO {
         std::string name;
         uint64_t size;

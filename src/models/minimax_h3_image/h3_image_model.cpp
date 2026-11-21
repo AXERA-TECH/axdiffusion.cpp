@@ -1,10 +1,14 @@
 // MiniMax-H3-Image plugin: tokenizer -> Qwen3-VL text encoder (NPU) -> H3 DiT (NPU) -> image VAE (NPU).
+#include <algorithm>
+#include <cstdlib>
 #include <fstream>
 
 #include "common.hpp"
 #include "edit_host.hpp"
 #include "h3_dit.hpp"
 #include "h3_image_vae.hpp"
+#include "h3_image_vae_encoder.hpp"
+#include "json.hpp"
 #include "lora.hpp"
 #include "model.hpp"
 #include "model_dir.hpp"
@@ -15,6 +19,17 @@
 namespace axd {
 
 namespace {
+
+// Raw little-endian file -> vector (used for debug inputs such as precomputed vision features).
+template <typename T>
+std::vector<T> read_raw(const std::string &path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) fail("cannot read " + path);
+    std::vector<T> v(size_t(f.tellg()) / sizeof(T));
+    f.seekg(0);
+    f.read(reinterpret_cast<char *>(v.data()), std::streamsize(v.size() * sizeof(T)));
+    return v;
+}
 
 template <typename T>
 void dump(const std::string &dir, const std::string &name, const std::vector<T> &v) {
@@ -40,6 +55,15 @@ public:
         text_ = std::make_unique<TextEncoder>(*dir_, *text_w_);
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
+        if (dir_->has_axmodel("image-vae-encode")) {
+            vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
+            std::ifstream cf(dir_->file("vae/config.json"));
+            auto cfg = nlohmann::json::parse(cf);
+            latents_mean_ = cfg.at("latents_mean").get<std::vector<float>>();
+            latents_std_ = cfg.at("latents_std").get<std::vector<float>>();
+            if (latents_mean_.size() != size_t(kLatentChannels) || latents_std_.size() != size_t(kLatentChannels))
+                fail("vae/config.json: latents_mean/std must have 24 entries");
+        }
         if (!opt.lora_dir.empty())
             lora_ = std::make_unique<LoraManager>(opt.lora_dir, dir_->file("dit/shared.safetensors"), opt.lora_cache,
                                                   dit_->lora_ranks());
@@ -52,6 +76,7 @@ public:
     ~H3ImageModel() override {
         // NPU objects go before the runtime.
         lora_.reset();
+        vae_enc_.reset();
         vae_.reset();
         dit_.reset();
         text_.reset();
@@ -66,9 +91,10 @@ public:
         i.arch = "minimax-h3-image";
         i.name = "minimax-h3-image";
         i.tasks = {Task::txt2img};
+        if (edit_ready()) i.tasks.push_back(Task::edit);
         i.sizes = {{1024, 1024}, {2048, 2048}};
-        i.max_prompt_tokens = kMaxTextTokens;
-        i.max_references = 0;
+        i.max_prompt_tokens = std::min(text_->max_tokens(), dit_->max_text_rows(64 * 64 / 4));
+        i.max_references = edit_ready() ? 3 : 0;
         i.lora = lora_ != nullptr;
         return i;
     }
@@ -77,9 +103,15 @@ public:
     double load_seconds() const override { return load_s_; }
     Runtime &runtime() override { return *rt_; }
 
+    // Edit needs the edit DiT kernels + AdaLN table, the paged deepstack text kernels, the VAE encoder and vision
+    // features (the ViT kernel, or AXD_EDIT_VISION=<dir> with precomputed features for testing).
+    bool edit_ready() const {
+        return dit_->supports_edit() && text_->supports_vision() && vae_enc_ &&
+               (dir_->has_axmodel("vision-vit") || std::getenv("AXD_EDIT_VISION"));
+    }
+
     Result run(const Request &req, Progress &progress) override {
-        if (req.task == Task::edit || !req.images.empty())
-            fail("reference-image editing is not available with this model directory yet (edit kernels missing)");
+        if (req.task == Task::edit || !req.images.empty()) return run_edit(req, progress);
         if (req.task != Task::txt2img) fail(std::string("task ") + task_name(req.task) + " is not supported by this model");
         if (req.width != req.height || (req.width != 1024 && req.width != 2048))
             fail("supported sizes: 1024x1024, 2048x2048");
@@ -104,8 +136,11 @@ public:
         double t0 = now_s();
         r.token_ids = tok_->encode(req.prompt);
         if (r.token_ids.empty()) fail("prompt produced no tokens");
-        if (r.token_ids.size() > size_t(kMaxTextTokens)) {
-            r.token_ids.resize(kMaxTextTokens);
+        const int lat0 = req.width / 16;
+        const int max_text = std::min(text_->max_tokens(), dit_->max_text_rows(lat0 * lat0 / 4, lora ? lora->rank : 0));
+        if (max_text <= 0) fail("no DiT kernel tier for this resolution");
+        if (r.token_ids.size() > size_t(max_text)) {
+            r.token_ids.resize(max_text);
             r.truncated = true;
         }
         r.seconds["tokenize"] = now_s() - t0;
@@ -122,15 +157,145 @@ public:
         Dit::Timing dt;
         dit_->run(hidden, int(r.token_ids.size()), lat, lat, sample, steps, blocks, dt, lora, &progress);
         r.seconds["dit"] = dt.prepare + dt.steps;
-        double sum = 0;
-        for (double b : dt.block_seconds) sum += b;
-        r.metrics["block_mean_s"] = dt.block_seconds.empty() ? 0 : sum / dt.block_seconds.size();
+        // wall time per block (with async launches the per-launch host times only cover binding/submission)
+        r.metrics["block_mean_s"] = dt.block_seconds.empty() ? 0 : dt.steps / double(dt.block_seconds.size());
         r.metrics["tokens"] = double(r.token_ids.size());
         r.metrics["sequence"] = dit_->used();
         r.metrics["padded"] = dit_->padded();
         auto latents = unpatchify(sample, lat, lat);
         dump(req.dump_dir, "latents.f32", latents);
 
+        progress("vae");
+        Image img;
+        double vae_s = 0;
+        img.rgb = vae_->decode(latents, lat, lat, vae_s);
+        img.width = img.height = req.width;
+        r.seconds["vae"] = vae_s;
+        r.images.push_back(std::move(img));
+        r.seconds["total"] = now_s() - t_all;
+        return r;
+    }
+
+    Result run_edit(const Request &req, Progress &progress) {
+        if (!edit_ready()) fail("reference-image editing needs edit kernels that this model directory does not have");
+        if (req.images.empty()) fail("edit needs at least one reference image");
+        if (req.images.size() > 9) fail("at most 9 reference images");
+        if (!req.loras.empty()) fail("LoRA is not supported together with reference editing yet");
+        if (req.width != req.height || (req.width != 1024 && req.width != 2048))
+            fail("supported sizes: 1024x1024, 2048x2048");
+        if (req.prompt.empty()) fail("prompt is empty");
+        const int steps = req.steps ? req.steps : kSteps;
+        const int blocks = req.blocks ? req.blocks : kDitLayers;
+        rt_->bind_thread();
+        Result r;
+        double t_all = now_s();
+        const int n_ref = int(req.images.size());
+        TorchGenerator gen(req.seed);
+
+        // 1) references -> VAE latents (posterior sample, fp16 rounding, normalization)
+        progress("vae_encode");
+        double t0 = now_s();
+        std::vector<std::vector<float>> ref_latents(n_ref);
+        std::vector<std::array<int, 2>> ref_grids(n_ref);
+        std::vector<Image> vit_copies(n_ref);
+        for (int k = 0; k < n_ref; ++k) {
+            const Image &src = req.images[k];
+            if (std::min(src.width, src.height) < 32) fail("reference image is too small");
+            Image vimg = edit::resize_for_vae(src);
+            vit_copies[k] = edit::resize_for_vit(src);
+            int h = 0, w = 0;
+            auto px = edit::vae_pixels(vimg, h, w);  // [3,h,w]
+            std::vector<int> ys, yo, xs, xo;
+            edit::split_tiles(h, kVaeEncTile, 64, 16, ys, yo);
+            edit::split_tiles(w, kVaeEncTile, 64, 16, xs, xo);
+            std::vector<std::vector<float>> tiles;
+            for (int ty : ys)
+                for (int tx : xs) {
+                    if (ty + kVaeEncTile > h || tx + kVaeEncTile > w) fail("reference smaller than one VAE tile");
+                    std::vector<float> t(size_t(3) * kVaeEncTile * kVaeEncTile);
+                    for (int c = 0; c < 3; ++c)
+                        for (int y = 0; y < kVaeEncTile; ++y)
+                            std::copy_n(&px[(size_t(c) * h + ty + y) * w + tx], kVaeEncTile,
+                                        &t[(size_t(c) * kVaeEncTile + y) * kVaeEncTile]);
+                    tiles.push_back(std::move(t));
+                }
+            auto moments_tiles = vae_enc_->encode_tiles(tiles);
+            for (auto &v : yo) v /= 16;
+            for (auto &v : xo) v /= 16;
+            const int lh = h / 16, lw = w / 16;
+            auto moments = edit::stitch_tiles(moments_tiles, kVaeEncMoments, kVaeEncTileLatent, kVaeEncTileLatent, yo,
+                                              xo, lh, lw);
+            auto eps = gen.randn(size_t(kLatentChannels) * lh * lw);
+            ref_latents[k] = edit::posterior_latent(moments, eps, lh, lw, latents_mean_.data(), latents_std_.data());
+            ref_grids[k] = {lh, lw};
+            dump(req.dump_dir, "reference_latent_" + std::to_string(k) + ".f32", ref_latents[k]);
+        }
+        r.seconds["vae_encode"] = now_s() - t0;
+
+        // 2) generator order after the posterior draws: target noise, then one noise per reference
+        const int lat = req.width / 16;
+        auto noise = gen.randn(size_t(kLatentChannels) * lat * lat);
+        DitEdit de;
+        for (int k = 0; k < n_ref; ++k) {
+            auto rn = gen.randn(ref_latents[k].size());
+            edit::noise_reference(ref_latents[k], rn);
+            auto rows = patchify(ref_latents[k], ref_grids[k][0], ref_grids[k][1]);
+            de.reference_rows.insert(de.reference_rows.end(), rows.begin(), rows.end());
+        }
+
+        // 3) vision features [n_ref*tokens, 5120] x 4 (merger, deepstack 0..2)
+        progress("vision");
+        t0 = now_s();
+        std::vector<std::array<int, 3>> grids(n_ref);
+        for (int k = 0; k < n_ref; ++k) edit::vit_pixel_values(vit_copies[k], grids[k]);
+        std::vector<uint16_t> merger, ds[3];
+        if (const char *vd = std::getenv("AXD_EDIT_VISION")) {
+            merger = read_raw<uint16_t>(std::string(vd) + "/vision_merger.bf16");
+            for (int i = 0; i < 3; ++i) ds[i] = read_raw<uint16_t>(std::string(vd) + "/vision_deepstack_" + std::to_string(i) + ".bf16");
+        } else {
+            fail("the ViT kernel is not wired yet");
+        }
+        r.seconds["vision"] = now_s() - t0;
+
+        // 4) presentation + paged text encoder with vision rows and deepstack
+        progress("text_encoder");
+        t0 = now_s();
+        std::vector<std::vector<int32_t>> labels(n_ref);
+        for (int k = 0; k < n_ref; ++k) labels[k] = tok_->encode("Picture " + std::to_string(k + 1) + ": ");
+        auto prompt_ids = tok_->encode(req.prompt);
+        auto pres = edit::make_presentation(labels, prompt_ids, grids);
+        auto mrope = edit::mrope_positions(pres, grids);
+        TextVision tv;
+        for (int i = 0; i < int(pres.mm_types.size()); ++i)
+            if (pres.mm_types[i] == 1) tv.rows.push_back(i);
+        if (merger.size() != tv.rows.size() * size_t(kDitTextDim))
+            fail("vision features do not match the image tokens (" + std::to_string(merger.size() / kDitTextDim) +
+                 " vs " + std::to_string(tv.rows.size()) + ")");
+        tv.merger = merger.data();
+        for (int i = 0; i < 3; ++i) tv.deepstack[i] = ds[i].data();
+        if (int(pres.ids.size()) > text_->max_tokens()) fail("prompt is too long for editing");
+        r.token_ids = pres.ids;
+        auto hidden = text_->encode(pres.ids, &mrope, &tv);
+        r.seconds["text_encoder"] = now_s() - t0;
+        dump(req.dump_dir, "text_hidden.bf16", hidden);
+
+        // 5) DiT over [text | references | target]
+        const int text_rows = int(pres.ids.size());
+        de.text_tags = pres.token_tags;
+        auto layout = edit::packed_layout(pres.token_tags, ref_grids, lat, lat);
+        de.positions = layout.position_ids;
+        auto sample = patchify(noise, lat, lat);
+        Dit::Timing dt;
+        dit_->run(hidden, text_rows, lat, lat, sample, steps, blocks, dt, nullptr, &progress, &de);
+        r.seconds["dit"] = dt.prepare + dt.steps;
+        r.metrics["tokens"] = double(text_rows);
+        r.metrics["references"] = double(n_ref);
+        r.metrics["sequence"] = dit_->used();
+        r.metrics["padded"] = dit_->padded();
+        auto latents = unpatchify(sample, lat, lat);
+        dump(req.dump_dir, "latents.f32", latents);
+
+        // 6) decode
         progress("vae");
         Image img;
         double vae_s = 0;
@@ -152,6 +317,8 @@ private:
     std::unique_ptr<TextEncoder> text_;
     std::unique_ptr<Dit> dit_;
     std::unique_ptr<Vae> vae_;
+    std::unique_ptr<VaeEncoder> vae_enc_;
+    std::vector<float> latents_mean_, latents_std_;
     std::unique_ptr<LoraManager> lora_;
     double load_s_ = 0;
 };
