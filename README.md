@@ -1,7 +1,7 @@
 # axdiffusion.cpp
 
 在 AXERA AX8860 NPU 上运行文生图模型的 C++ 推理程序。文本编码器、DiT、VAE 全部在 NPU 上执行；
-所有权重启动时一次性常驻 NPU 内存，之后每张图只做计算。提供命令行工具和兼容
+所有权重启动时一次性常驻 NPU 内存，之后每张图只做计算。提供命令行工具、内置网页，以及兼容
 **OpenAI Images API** 与 **A1111 (SD WebUI) API** 的 HTTP 服务，支持**动态 LoRA**。
 
 当前支持的模型：**MiniMax-H3-Image**（6 步蒸馏，无 CFG）。
@@ -64,6 +64,7 @@ make -C build -j8
 |---|---|
 | OpenAI Images | `POST /v1/images/generations`，`GET /v1/models` |
 | A1111 / SD WebUI | `POST /sdapi/v1/txt2img`，`GET /sdapi/v1/sd-models`、`/sdapi/v1/loras`、`/sdapi/v1/options`、`/sdapi/v1/samplers` |
+| 网页 | `GET /`：内置生图页面（提示词、尺寸、种子、LoRA 叠加、参考图、历史与下载） |
 | 其它 | `GET /health`，`GET /v1/loras`，`GET /files/<name>.png` |
 
 OpenAI 格式（`n` ≤ 4；`response_format` 为 `b64_json` 或 `url`）：
