@@ -55,7 +55,19 @@
 
 其它：`GET /sdapi/v1/sd-models`、`/sdapi/v1/loras`、`/sdapi/v1/options`、`/sdapi/v1/samplers`。
 
+## 异步任务（网页与长任务使用）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/jobs` | 提交：`{task, prompt, width, height, seed, steps, loras, images:[base64]}`，返回 202 与任务对象 |
+| GET | `/v1/jobs/{id}` | 状态 `queued/running/succeeded/failed/cancelled`、阶段 `stage`、进度 `progress.step/total`；成功后带 `images`（base64 PNG）与 `info` |
+| GET | `/v1/jobs/{id}/events` | Server-Sent Events：每次进度变化一条 `progress`，结束时一条 `done` |
+| DELETE | `/v1/jobs/{id}` | 取消：排队中的直接移除，运行中的在下一步停止 |
+
+`task` 取值：`txt2img`、`edit`（带 `images` 时自动为 edit），以及视频任务（`txt2video` 等，视频模型提供时可用）。
+同一时刻只有一个任务在 NPU 上执行，其余排队；同步接口（OpenAI、A1111）内部也走同一个队列。
+
 ## 其它
 
-- `GET /health`：`{"status": "ok", "load_s": ..., "requests": ..., "cmm_used_gib": ...}`
+- `GET /health`：`{"status", "model", "arch", "tasks", "sizes", "lora", "load_s", "requests", "queued", "cmm_used_gib"}`
 - `GET /files/<name>.png`：`response_format=url` 生成的图片
