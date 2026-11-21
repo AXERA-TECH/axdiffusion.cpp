@@ -73,7 +73,10 @@ private:
     const DitWeights &w_;
     std::map<int, std::unique_ptr<Model>> block_, final_, refiner_, rmsnorm_;
     std::map<int, std::map<int, std::unique_ptr<Model>>> lora_block_;  // [rank][padded]
-    int fast_tier_ = 0;  // static (no runtime bounds) 1024x1024 short-prompt tier, if present
+    // Runtime kernels accept used rows in (padded - granule, padded]; the granule comes from the manifest
+    // ("granule N", default 512). Kernels without a sequence_bounds input are static (1024x1024, 51-token prompt).
+    std::map<const Model *, int> granule_;
+    bool static_ = false;  // the selected kernel is static
     std::map<int, std::unique_ptr<DitShape>> shapes_;
     std::map<int, std::unique_ptr<RefinerWs>> refiners_;
     Buf refined_text_;

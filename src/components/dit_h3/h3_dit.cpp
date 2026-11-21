@@ -58,20 +58,25 @@ struct RefinerWs {
 Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
     // Sequence tiers come from the model directory's manifest ("... padded N ..."), so new tiers
     // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
-    for (auto &kv : dir.tiers("dit-block", "padded ")) block_[kv.first] = std::make_unique<Model>(kv.second);
+    auto load = [&](const std::string &purpose, std::map<int, std::unique_ptr<Model>> &into) {
+        auto shapes = dir.tier_shapes(purpose, "padded ");
+        for (auto &kv : dir.tiers(purpose, "padded ")) {
+            into[kv.first] = std::make_unique<Model>(kv.second);
+            granule_[into[kv.first].get()] = ModelDir::shape_int(shapes[kv.first], "granule ", 512);
+        }
+    };
+    load("dit-block", block_);
     for (auto &kv : dir.tiers("dit-final", "padded ")) final_[kv.first] = std::make_unique<Model>(kv.second);
     // LoRA block kernels per rank tier: "dit-block-lora" is rank 64, "dit-block-lora-rN" is rank N.
-    for (auto &kv : dir.tiers("dit-block-lora", "padded ")) lora_block_[64][kv.first] = std::make_unique<Model>(kv.second);
-    for (int r : {32, 96, 128, 192, 256})
-        for (auto &kv : dir.tiers("dit-block-lora-r" + std::to_string(r), "padded "))
-            lora_block_[r][kv.first] = std::make_unique<Model>(kv.second);
+    load("dit-block-lora", lora_block_[64]);
+    for (int r : {32, 96, 128, 192, 256}) load("dit-block-lora-r" + std::to_string(r), lora_block_[r]);
+    for (auto it = lora_block_.begin(); it != lora_block_.end();)
+        it = it->second.empty() ? lora_block_.erase(it) : std::next(it);
     for (auto &kv : dir.tiers("dit-refiner", "")) refiner_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : block_)
         if (!final_.count(kv.first)) fail("DiT tier " + std::to_string(kv.first) + " has a block but no final kernel");
     if (block_.empty() || refiner_.empty()) fail("model directory has no DiT / refiner kernels");
-    // The 1280 tier is compiled without runtime sequence bounds (static 1024x1024 + 51-token prompt path).
-    if (block_.count(1280) && !block_[1280]->has_input("sequence_bounds")) fast_tier_ = 1280;
     // Allocate the workspaces of the common tiers up front; larger tiers are allocated on first use.
     for (auto &kv : block_)
         if (kv.first <= 4608) shape(kv.first);
@@ -149,27 +154,32 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
                   const LoraSet *lora) {
     image_tokens_ = (latent_h / 2) * (latent_w / 2);
     used_ = text_rows + image_tokens_;
-    const bool fast = fast_tier_ && latent_h == 64 && latent_w == 64 && text_rows == 51;
+    // static kernels are compiled for exactly this geometry
+    const bool fast = latent_h == 64 && latent_w == 64 && text_rows == 51;
+    if (lora && !lora_block_.count(lora->rank))
+        fail("no rank-" + std::to_string(lora->rank) + " LoRA block kernels in this model directory");
+    // smallest tier whose kernel (LoRA variant when a LoRA set is active) accepts this sequence
+    const auto &cands = lora ? lora_block_.at(lora->rank) : block_;
     padded_ = 0;
-    if (fast) {
-        padded_ = fast_tier_;
-    } else {
-        // smallest runtime tier that holds the sequence (the kernel requires padded - 512 < used <= padded)
-        for (auto &kv : block_)
-            if (kv.first != fast_tier_ && kv.first >= used_ && kv.first - 512 < used_) {
-                padded_ = kv.first;
-                break;
-            }
+    static_ = false;
+    for (auto &kv : cands) {
+        const int P = kv.first;
+        if (P < used_ || !final_.count(P)) continue;
+        const Model *m = kv.second.get();
+        const bool runtime = m->has_input("sequence_bounds");
+        if (runtime ? P - granule_.at(m) < used_ : fast) {
+            padded_ = P;
+            static_ = !runtime;
+            break;
+        }
     }
     if (!padded_) {
         std::string have;
-        for (auto &kv : block_) have += " " + std::to_string(kv.first);
-        fail("no DiT kernel tier for a " + std::to_string(used_) + "-token sequence (available:" + have +
+        for (auto &kv : cands) have += " " + std::to_string(kv.first);
+        fail("no DiT kernel tier for a " + std::to_string(used_) + "-token sequence" +
+             (lora ? " with a rank-" + std::to_string(lora->rank) + " LoRA" : std::string()) + " (available:" + have +
              "); the prompt is too long for this resolution");
     }
-    if (lora && !has_lora_kernel(padded_, lora->rank))
-        fail("LoRA is not available for this shape (no rank-" + std::to_string(lora->rank) +
-             " LoRA block kernel for padded length " + std::to_string(padded_) + ")");
     text_rows_ = text_rows;
 
     // 1) text projection 5120 -> 5376 on the host (any prompt length)
@@ -180,7 +190,7 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
 
     // 2) token refiner (2 layers) + RMSNorm on the NPU
     int rows = 0;
-    if (fast && refiner_.count(64)) rows = 64;  // static 64-row refiner pairs with the static fast tier
+    if (static_ && refiner_.count(64)) rows = 64;  // static 64-row refiner pairs with the static block kernel
     for (auto it = refiner_.begin(); !rows && it != refiner_.end(); ++it)
         if (it->first >= text_rows && it->first != 64) rows = it->first;
     if (!rows) fail("no token refiner tier for " + std::to_string(text_rows) + " text rows");

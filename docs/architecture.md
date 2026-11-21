@@ -42,7 +42,8 @@ src/runtime/           与模型无关：NPU 设备/内存、AXModel 调用、�
 | 媒体 IO | PNG/JPEG 输入、PNG 输出 | MP4（板载硬件 H.264/H.265 编码）+ 音频封装 |
 
 组件之间只通过设备缓冲区（`Buf`）和主机张量交换数据；每个组件有自己的 kernel 清单查询
-（`ModelDir::tiers(purpose, tag)`），按请求形状选最小可用档位。
+（`ModelDir::tiers(purpose, tag)`），按请求形状选最小可用档位。DiT 档位规则：有 `sequence_bounds` 输入的是运行时 kernel，
+接受 `padded - granule < used <= padded`（granule 取 manifest shape 中的 "granule N"，缺省 512）；没有的是静态 kernel，只用于编译时的固定形状。
 
 ## 4. 模型插件
 

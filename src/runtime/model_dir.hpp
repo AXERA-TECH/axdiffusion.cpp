@@ -18,6 +18,10 @@ public:
     // Every AXModel of a purpose keyed by the first integer after `tag` in its shape string
     // (e.g. tag "padded " -> padded sequence length, tag "" with "-row" shapes -> row count).
     std::map<int, std::string> tiers(const std::string &purpose, const std::string &tag) const;
+    // The shape strings of the same entries (for per-kernel attributes such as "granule N").
+    std::map<int, std::string> tier_shapes(const std::string &purpose, const std::string &tag) const;
+    // First integer after `key` in a shape string, or `fallback`.
+    static int shape_int(const std::string &shape, const std::string &key, int fallback);
     std::string file(const std::string &rel) const { return root_ + "/" + rel; }
     bool exists(const std::string &rel) const;
     const std::string &root() const { return root_; }

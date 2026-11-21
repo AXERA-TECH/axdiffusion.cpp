@@ -51,18 +51,42 @@ bool ModelDir::has_axmodel(const std::string &purpose, const std::string &shape_
     return false;
 }
 
+namespace {
+// first integer after `tag` in `shape` (tag "" = first integer anywhere), or -1
+int int_after(const std::string &shape, const std::string &tag) {
+    size_t p = tag.empty() ? 0 : shape.find(tag);
+    if (p == std::string::npos) return -1;
+    p += tag.size();
+    while (p < shape.size() && !std::isdigit(static_cast<unsigned char>(shape[p]))) ++p;
+    if (p >= shape.size()) return -1;
+    return std::stoi(shape.substr(p));
+}
+}  // namespace
+
 std::map<int, std::string> ModelDir::tiers(const std::string &purpose, const std::string &tag) const {
     std::map<int, std::string> out;
     for (auto &m : models_) {
         if (m.purpose != purpose) continue;
-        size_t p = tag.empty() ? 0 : m.shape.find(tag);
-        if (p == std::string::npos) continue;
-        p += tag.size();
-        while (p < m.shape.size() && !std::isdigit(static_cast<unsigned char>(m.shape[p]))) ++p;
-        if (p >= m.shape.size()) continue;
-        out[std::stoi(m.shape.substr(p))] = root_ + "/axmodels/" + m.file;
+        int n = int_after(m.shape, tag);
+        if (n >= 0) out[n] = root_ + "/axmodels/" + m.file;
     }
     return out;
+}
+
+std::map<int, std::string> ModelDir::tier_shapes(const std::string &purpose, const std::string &tag) const {
+    std::map<int, std::string> out;
+    for (auto &m : models_) {
+        if (m.purpose != purpose) continue;
+        int n = int_after(m.shape, tag);
+        if (n >= 0) out[n] = m.shape;
+    }
+    return out;
+}
+
+int ModelDir::shape_int(const std::string &shape, const std::string &key, int fallback) {
+    if (shape.find(key) == std::string::npos) return fallback;
+    int n = int_after(shape, key);
+    return n >= 0 ? n : fallback;
 }
 
 
