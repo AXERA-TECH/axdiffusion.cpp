@@ -3,7 +3,9 @@
 //
 // * Formats: diffusers/PEFT (lora_A / lora_B) and ComfyUI/kohya (lora_down / lora_up / alpha).
 // * Several LoRAs are concatenated along the rank axis; strength * alpha / rank is folded into B.
-//   The kernel is compiled for a fixed max rank (64); unused rank rows are zero.
+//   Block kernels are compiled for fixed max ranks (e.g. 64 and 128). A combination uses the smallest
+//   rank tier that holds its largest per-projection rank (unused rows are zero); above the largest tier
+//   B*A is replaced by its best low-rank approximation (truncated SVD).
 // * DiT blocks: A/B uploaded once per LoRA combination and cached (LRU).
 // * Token refiner (2 layers, bf16 weights): merged on the host into a cached weight copy.
 // * Unknown or unsupported keys are an error, never silently ignored.
@@ -21,11 +23,12 @@
 
 namespace axd {
 
-constexpr int kLoraRank = 64;
+constexpr int kLoraDefaultRank = 64;
 
 // One resident LoRA combination.
 struct LoraSet {
     std::string key;
+    int rank = kLoraDefaultRank;                // kernel rank tier this set is packed for
     DeviceBuffer blocks;                        // per block: A/B for qkv,out,fc1,fc2
     std::vector<std::array<Buf, 8>> block_ab;   // [50][a_qkv,b_qkv,a_out,b_out,a_fc1,b_fc1,a_fc2,b_fc2]
     std::vector<bool> block_active;             // blocks without any LoRA use the zero set
@@ -35,11 +38,13 @@ struct LoraSet {
 
 class LoraManager {
 public:
-    LoraManager(std::string lora_dir, const std::string &shared_safetensors, int cache_size);
+    // ranks: the rank tiers that have block kernels (from the DiT); empty = {64}.
+    LoraManager(std::string lora_dir, const std::string &shared_safetensors, int cache_size,
+                std::vector<int> ranks = {});
     ~LoraManager();
     // Returns the resident set for this combination (building and caching it if needed).
     const LoraSet &get(const std::vector<LoraSpec> &specs);
-    const std::array<Buf, 8> &zero_ab() const { return zero_ab_; }
+    const std::vector<int> &ranks() const { return ranks_; }
     std::vector<std::string> available() const;
 
 private:
@@ -49,8 +54,12 @@ private:
     std::string shared_path_;
     int cache_size_;
     std::list<std::unique_ptr<LoraSet>> cache_;  // front = most recently used
-    DeviceBuffer zero_;
-    std::array<Buf, 8> zero_ab_;
+    std::vector<int> ranks_;
+    struct Zero {
+        DeviceBuffer buf;
+        std::array<Buf, 8> ab;
+    };
+    std::map<int, Zero> zero_;  // per rank tier: A/B for blocks a LoRA does not touch
 };
 
 // Kernel input names of the LoRA branch, in LoraSet::block_ab order.

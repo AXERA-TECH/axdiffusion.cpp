@@ -36,7 +36,7 @@ src/runtime/           与模型无关：NPU 设备/内存、AXModel 调用、�
 | 文本编码器 | Qwen3-VL 前 N 层，分页 KV（256/页），视觉 token + deepstack | T5-XXL、CLIP |
 | 视觉编码器 | Qwen3-VL ViT（编辑参考图） | — |
 | DiT 运行器 | 块循环、序列档位自动发现、多时间步 AdaLN、参考 token 冻结、LoRA 支路 | 其它 DiT（MMDiT 双流等）按块 ABI 描述接入 |
-| LoRA | diffusers/PEFT、ComfyUI、kohya；rank 拼接、SVD 截断兜底、组合缓存 | 文本编码器 LoRA、DoRA |
+| LoRA | diffusers/PEFT、ComfyUI、kohya；rank 拼接、rank 档位自动选择（64/128，manifest `dit-block-lora[-rN]`）、SVD 截断兜底、组合缓存 | 文本编码器 LoRA、DoRA |
 | VAE | 图像 2D ViT 解码（256 px 分块） | 图像 VAE 编码、3D 视频 VAE（时间+空间分块）、音频 VAE |
 | 调度器 | 6 步蒸馏固定 sigma + Euler（velocity） | flow-matching 标准步数、CFG、shift |
 | 媒体 IO | PNG/JPEG 输入、PNG 输出 | MP4（板载硬件 H.264/H.265 编码）+ 音频封装 |

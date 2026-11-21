@@ -60,7 +60,11 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
     // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
     for (auto &kv : dir.tiers("dit-block", "padded ")) block_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : dir.tiers("dit-final", "padded ")) final_[kv.first] = std::make_unique<Model>(kv.second);
-    for (auto &kv : dir.tiers("dit-block-lora", "padded ")) lora_block_[kv.first] = std::make_unique<Model>(kv.second);
+    // LoRA block kernels per rank tier: "dit-block-lora" is rank 64, "dit-block-lora-rN" is rank N.
+    for (auto &kv : dir.tiers("dit-block-lora", "padded ")) lora_block_[64][kv.first] = std::make_unique<Model>(kv.second);
+    for (int r : {32, 96, 128, 192, 256})
+        for (auto &kv : dir.tiers("dit-block-lora-r" + std::to_string(r), "padded "))
+            lora_block_[r][kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : dir.tiers("dit-refiner", "")) refiner_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : block_)
@@ -76,6 +80,13 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
 }
 
 Dit::~Dit() = default;
+
+std::vector<int> Dit::lora_ranks() const {
+    std::vector<int> out;
+    for (auto &kv : lora_block_)
+        if (!kv.second.empty()) out.push_back(kv.first);
+    return out;
+}
 
 DitShape &Dit::shape(int padded) {
     auto &slot = shapes_[padded];
@@ -156,8 +167,9 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
         fail("no DiT kernel tier for a " + std::to_string(used_) + "-token sequence (available:" + have +
              "); the prompt is too long for this resolution");
     }
-    if (lora && !lora_block_.count(padded_))
-        fail("LoRA is not available for this shape (no LoRA block kernel for padded length " + std::to_string(padded_) + ")");
+    if (lora && !has_lora_kernel(padded_, lora->rank))
+        fail("LoRA is not available for this shape (no rank-" + std::to_string(lora->rank) +
+             " LoRA block kernel for padded length " + std::to_string(padded_) + ")");
     text_rows_ = text_rows;
 
     // 1) text projection 5120 -> 5376 on the host (any prompt length)
@@ -303,7 +315,7 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
         if (s.bounds.size()) in["sequence_bounds"] = s.bounds;
         Model *model = block_[padded_].get();
         if (lora) {
-            model = lora_block_[padded_].get();
+            model = lora_block_[lora->rank][padded_].get();
             const auto &ab = lora->block_ab[l];
             for (int k = 0; k < 8; ++k) in[kLoraInputs[k]] = ab[k];
         }

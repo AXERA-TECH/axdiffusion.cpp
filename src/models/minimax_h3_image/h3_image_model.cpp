@@ -41,7 +41,8 @@ public:
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
         if (!opt.lora_dir.empty())
-            lora_ = std::make_unique<LoraManager>(opt.lora_dir, dir_->file("dit/shared.safetensors"), opt.lora_cache);
+            lora_ = std::make_unique<LoraManager>(opt.lora_dir, dir_->file("dit/shared.safetensors"), opt.lora_cache,
+                                                  dit_->lora_ranks());
         load_s_ = now_s() - t0;
         size_t used = 0, total = 0;
         rt_->cmm(used, total);
@@ -96,6 +97,7 @@ public:
             double tl = now_s();
             lora = &lora_->get(req.loras);
             r.seconds["lora_build"] = now_s() - tl;
+            r.metrics["lora_rank"] = lora->rank;
         }
 
         progress("text_encoder");

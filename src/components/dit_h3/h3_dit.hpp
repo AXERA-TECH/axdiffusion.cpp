@@ -55,7 +55,11 @@ public:
     void run(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora = nullptr,
              Progress *progress = nullptr);
-    bool has_lora_kernel(int padded) const { return lora_block_.count(padded) != 0; }
+    bool has_lora_kernel(int padded, int rank) const {
+        auto it = lora_block_.find(rank);
+        return it != lora_block_.end() && it->second.count(padded) != 0;
+    }
+    std::vector<int> lora_ranks() const;  // rank tiers that have LoRA block kernels
     int used() const { return used_; }
     int padded() const { return padded_; }
 
@@ -67,7 +71,8 @@ private:
     void step(std::vector<float> &sample, int step_index, int blocks, Timing &t, const LoraSet *lora);
 
     const DitWeights &w_;
-    std::map<int, std::unique_ptr<Model>> block_, lora_block_, final_, refiner_, rmsnorm_;
+    std::map<int, std::unique_ptr<Model>> block_, final_, refiner_, rmsnorm_;
+    std::map<int, std::map<int, std::unique_ptr<Model>>> lora_block_;  // [rank][padded]
     int fast_tier_ = 0;  // static (no runtime bounds) 1024x1024 short-prompt tier, if present
     std::map<int, std::unique_ptr<DitShape>> shapes_;
     std::map<int, std::unique_ptr<RefinerWs>> refiners_;

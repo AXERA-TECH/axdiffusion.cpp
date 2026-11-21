@@ -98,11 +98,11 @@ Python 调用示例见 [examples/](examples/)。
 - 把 `.safetensors` 格式的 LoRA 放进 `--lora-dir` 目录，按文件名（不含扩展名）引用。
 - 支持 diffusers / PEFT（`lora_A`、`lora_B`）与 ComfyUI / kohya（`lora_down`、`lora_up`、`alpha`）两种格式，
   作用于 DiT 50 个块和 token refiner 的 qkv / out / fc1 / fc2。
-- 多个 LoRA 可叠加，总 rank（每个投影）不超过 64；每个请求可单独设置强度。
+- 多个 LoRA 可叠加（按 rank 拼接），每个请求可单独设置强度。
 - 底模常驻不动，LoRA 在块 kernel 的低秩支路上执行；某个 LoRA 组合第一次使用时构建并缓存（约 5 s），
   之后切换只需重新绑定地址。
 - 文件中出现不支持的层或格式（如 DoRA、LoKr、文本编码器 LoRA）时直接报错并列出，不会静默忽略。
-- 1024×1024 与 2048×2048 都支持 LoRA。rank 超过 64 时自动用截断 SVD 压到 64（日志会给出保留的能量比例）。
+- 1024×1024 与 2048×2048 都支持 LoRA。块 kernel 有 rank 64 / 128 两档：按组合后最大的投影 rank 自动选最小够用的一档（128 档 DiT 约慢 8%）；超过 128 时自动用截断 SVD 压到 128（日志会给出保留的能量比例）。
 
 ## 当前限制
 

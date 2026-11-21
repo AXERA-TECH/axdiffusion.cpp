@@ -259,23 +259,29 @@ std::string fmt_scale(float s) {
 
 }  // namespace
 
-LoraManager::LoraManager(std::string lora_dir, const std::string &shared_safetensors, int cache_size)
-    : dir_(std::move(lora_dir)), shared_path_(shared_safetensors), cache_size_(std::max(1, cache_size)) {
-    // Zero A/B used by blocks a LoRA does not touch.
-    size_t total = 0;
-    std::array<size_t, 8> sz{};
-    for (int p = 0; p < 4; ++p) {
-        sz[2 * p] = size_t(kLoraRank) * kIn[p] * 2;
-        sz[2 * p + 1] = size_t(kOut[p]) * kLoraRank * 2;
+LoraManager::LoraManager(std::string lora_dir, const std::string &shared_safetensors, int cache_size,
+                         std::vector<int> ranks)
+    : dir_(std::move(lora_dir)), shared_path_(shared_safetensors), cache_size_(std::max(1, cache_size)),
+      ranks_(std::move(ranks)) {
+    if (ranks_.empty()) ranks_ = {kLoraDefaultRank};
+    std::sort(ranks_.begin(), ranks_.end());
+    ranks_.erase(std::unique(ranks_.begin(), ranks_.end()), ranks_.end());
+    for (int R : ranks_) {
+        size_t total = 0;
+        std::array<size_t, 8> sz{}, off{};
+        for (int p = 0; p < 4; ++p) {
+            sz[2 * p] = size_t(R) * kIn[p] * 2;
+            sz[2 * p + 1] = size_t(kOut[p]) * R * 2;
+        }
+        for (int i = 0; i < 8; ++i) {
+            off[i] = total;
+            total += (sz[i] + 255) / 256 * 256;
+        }
+        auto &z = zero_[R];
+        z.buf = DeviceBuffer(total, "lora-zero");
+        z.buf.buf().fill_zero();
+        for (int i = 0; i < 8; ++i) z.ab[i] = z.buf.buf().view(off[i], sz[i]);
     }
-    std::array<size_t, 8> off{};
-    for (int i = 0; i < 8; ++i) {
-        off[i] = total;
-        total += (sz[i] + 255) / 256 * 256;
-    }
-    zero_ = DeviceBuffer(total, "lora-zero");
-    zero_.buf().fill_zero();
-    for (int i = 0; i < 8; ++i) zero_ab_[i] = zero_.buf().view(off[i], sz[i]);
 }
 
 LoraManager::~LoraManager() = default;
@@ -318,7 +324,8 @@ const LoraSet &LoraManager::get(const std::vector<LoraSpec> &specs) {
         }
     double t0 = now_s();
     auto set = build(sorted, key);
-    AXD_LOG("LoRA set [%s] built in %.2f s (%.1f MiB)", key.c_str(), now_s() - t0, set->bytes / 1048576.0);
+    AXD_LOG("LoRA set [%s] built in %.2f s (rank tier %d, %.1f MiB)", key.c_str(), now_s() - t0, set->rank,
+            set->bytes / 1048576.0);
     cache_.push_front(std::move(set));
     while (int(cache_.size()) > cache_size_) cache_.pop_back();
     return *cache_.front();
@@ -387,14 +394,31 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
         }
     }
 
+    // rank tier: smallest kernel rank that holds the largest combined rank of any DiT block projection
+    int need = 0;
+    for (auto &kv : pieces) {
+        if (kv.first.refiner) continue;
+        int total = 0;
+        for (auto &p : kv.second) total += p.rank;
+        need = std::max(need, total);
+    }
+    int R = ranks_.back();
+    for (int r : ranks_)
+        if (r >= need) {
+            R = r;
+            break;
+        }
     auto set = std::make_unique<LoraSet>();
     set->key = key;
-    set->block_ab.assign(kDitLayers, zero_ab_);
+    set->rank = R;
+    const auto &zero_ab = zero_.at(R).ab;
+    set->block_ab.assign(kDitLayers, zero_ab);
     set->block_active.assign(kDitLayers, false);
 
-    // Build padded bf16 A [64,in] and B [out,64] for one target. If the combined rank exceeds the kernel's
-    // rank, B*A is replaced by its best rank-64 approximation (truncated SVD).
-    auto pack = [&](const std::vector<Piece> &ps, Proj proj, std::vector<uint16_t> &A, std::vector<uint16_t> &B) {
+    // Build padded bf16 A [K,in] and B [out,K] for one target (K = R for kernels, the full rank for host
+    // merges: K <= 0). If the combined rank exceeds K, B*A is replaced by its best rank-K approximation.
+    auto pack = [&](const std::vector<Piece> &ps, Proj proj, std::vector<uint16_t> &A, std::vector<uint16_t> &B,
+                    int K) {
         const int in = kIn[proj], out = kOut[proj];
         int total = 0;
         for (auto &p : ps) total += p.rank;
@@ -411,19 +435,20 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
             }
             r0 += p.rank;
         }
+        if (K <= 0) K = std::max(total, 1);
         int rank = total;
-        if (total > kLoraRank) {
-            double kept = truncate_rank(Bt, At, out, in, total, kLoraRank);
-            AXD_LOG("LoRA rank %d > %d on %s: truncated SVD keeps %.2f%% of the update energy", total, kLoraRank,
+        if (total > K) {
+            double kept = truncate_rank(Bt, At, out, in, total, K);
+            AXD_LOG("LoRA rank %d > %d on %s: truncated SVD keeps %.2f%% of the update energy", total, K,
                     kProjName[proj], kept * 100.0);
-            rank = kLoraRank;
+            rank = K;
         }
-        A.assign(size_t(kLoraRank) * in, 0);
-        B.assign(size_t(out) * kLoraRank, 0);
+        A.assign(size_t(K) * in, 0);
+        B.assign(size_t(out) * K, 0);
         for (int r = 0; r < rank; ++r)
             for (int k = 0; k < in; ++k) A[size_t(r) * in + k] = f32_to_bf16(At[size_t(r) * in + k]);
         for (int o = 0; o < out; ++o)
-            for (int r = 0; r < rank; ++r) B[size_t(o) * kLoraRank + r] = f32_to_bf16(Bt[size_t(o) * rank + r]);
+            for (int r = 0; r < rank; ++r) B[size_t(o) * K + r] = f32_to_bf16(Bt[size_t(o) * rank + r]);
     };
 
     // ---- DiT blocks: one allocation for all active blocks
@@ -437,7 +462,7 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
     std::array<size_t, 8> sz{};
     size_t per_block = 0;
     for (int i = 0; i < 8; ++i) {
-        sz[i] = zero_ab_[i].size;
+        sz[i] = zero_ab[i].size;
         per_block += (sz[i] + 255) / 256 * 256;
     }
     if (!active.empty()) {
@@ -449,7 +474,8 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
             for (size_t t = t0; t < t1; ++t) {
                 int b = active[t / 4], p = int(t % 4);
                 auto it = pieces.find({false, b, Proj(p)});
-                pack(it != pieces.end() ? it->second : std::vector<Piece>{}, Proj(p), packed[t * 2], packed[t * 2 + 1]);
+                pack(it != pieces.end() ? it->second : std::vector<Piece>{}, Proj(p), packed[t * 2], packed[t * 2 + 1],
+                     R);
             }
         });
         for (size_t ai = 0; ai < active.size(); ++ai) {
@@ -486,7 +512,8 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
             const Proj proj = kv.first.proj;
             const int in = kIn[proj], out = kOut[proj];
             std::vector<uint16_t> A, B;
-            pack(kv.second, proj, A, B);
+            pack(kv.second, proj, A, B, 0);
+            const int K = int(A.size() / size_t(in));
             std::string name = "refiner." + std::to_string(kv.first.index) + "." + kProjName[proj];
             auto &w = shared.get(name);
             auto *wp = reinterpret_cast<const uint16_t *>(w.data);
@@ -498,8 +525,8 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
                 std::vector<float> row(in);
                 for (size_t o = o0; o < o1; ++o) {
                     for (int k = 0; k < in; ++k) row[k] = bf16_to_f32(wp[o * in + k]);
-                    for (int r = 0; r < kLoraRank; ++r) {
-                        float b = bf16_to_f32(B[o * kLoraRank + r]);
+                    for (int r = 0; r < K; ++r) {
+                        float b = bf16_to_f32(B[o * K + r]);
                         if (b == 0.f) continue;
                         const float *a = &Af[size_t(r) * in];
 #pragma omp simd
