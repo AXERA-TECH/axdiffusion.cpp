@@ -47,16 +47,21 @@ public:
         rt_ = std::make_unique<Runtime>(opt.device);
         dir_ = std::make_unique<ModelDir>(model_dir);
         tok_ = std::make_unique<Tokenizer>(dir_->file("text_encoder/tokenizer/tokenizer.json"));
-        AXD_LOG("loading DiT weights");
+        double tp = now_s();
+        auto phase = [&](const char *what) {
+            AXD_LOG("%s: %.1f s", what, now_s() - tp);
+            tp = now_s();
+        };
         dit_w_ = load_dit_weights(*dir_);
-        AXD_LOG("loading text encoder weights");
+        phase("DiT weights");
         text_w_ = load_text_weights(*dir_);
-        AXD_LOG("loading VAE weights");
+        phase("text encoder weights");
         vae_w_ = load_vae_weights(*dir_);
-        AXD_LOG("loading AXModels");
+        phase("VAE weights");
         text_ = std::make_unique<TextEncoder>(*dir_, *text_w_);
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
+        phase("text/DiT/VAE kernels");
         if (dir_->has_axmodel("vision-vit")) vit_ = std::make_unique<VisionEncoder>(*dir_);
         if (dir_->has_axmodel("image-vae-encode")) {
             vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
@@ -67,6 +72,7 @@ public:
             if (latents_mean_.size() != size_t(kLatentChannels) || latents_std_.size() != size_t(kLatentChannels))
                 fail("vae/config.json: latents_mean/std must have 24 entries");
         }
+        phase("edit kernels (ViT, VAE encoder)");
         if (!opt.lora_dir.empty())
             lora_ = std::make_unique<LoraManager>(opt.lora_dir, dir_->file("dit/shared.safetensors"), opt.lora_cache,
                                                   dit_->lora_ranks());
@@ -118,7 +124,7 @@ public:
                 int w = int(std::lround(std::sqrt(area * r[0] / r[1]) / 32.0)) * 32;
                 int h = int(std::lround(std::sqrt(area * r[1] / r[0]) / 32.0)) * 32;
                 if (w < 256 || h < 256) continue;
-                if (dit_->pick_tier(64 + image_rows(w, h), false, 0, false)) out.push_back({w, h});
+                if (dit_->pick_tier(64 + image_rows(w, h), 0, false)) out.push_back({w, h});
             }
         return out;
     }
@@ -189,6 +195,7 @@ public:
         Dit::Timing dt;
         dit_->run(hidden, int(r.token_ids.size()), lat_h, lat_w, sample, steps, blocks, dt, lora, &progress);
         r.seconds["dit"] = dt.prepare + dt.steps;
+        r.seconds["dit_prepare"] = dt.prepare;
         // wall time per block (with async launches the per-launch host times only cover binding/submission)
         r.metrics["block_mean_s"] = dt.block_seconds.empty() ? 0 : dt.steps / double(dt.block_seconds.size());
         r.metrics["tokens"] = double(r.token_ids.size());
@@ -330,6 +337,7 @@ public:
         Dit::Timing dt;
         dit_->run(hidden, text_rows, lat_h, lat_w, sample, steps, blocks, dt, nullptr, &progress, &de);
         r.seconds["dit"] = dt.prepare + dt.steps;
+        r.seconds["dit_prepare"] = dt.prepare;
         r.metrics["tokens"] = double(text_rows);
         r.metrics["references"] = double(n_ref);
         r.metrics["sequence"] = dit_->used();

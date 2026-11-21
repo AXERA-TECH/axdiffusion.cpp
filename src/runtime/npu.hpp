@@ -25,6 +25,8 @@ public:
     void cmm(size_t &used, size_t &total) const;
     // AXCL contexts are per thread: call this in any thread (e.g. HTTP workers) before NPU calls.
     void bind_thread() const;
+    // Same for helper threads that have no Runtime reference (uses the process-wide runtime's context).
+    static void bind_current_thread();
 
 private:
     int device_;
@@ -70,7 +72,11 @@ public:
     explicit TensorBank(std::string name) : name_(std::move(name)) {}
     // Reserve space; data is copied when materialize() runs. `src` must stay valid until then.
     void add(const std::string &name, const void *src, size_t size);
-    void materialize();
+    // Entry read from a file range (pread) when materialized; `fd` must stay open until then.
+    void add_file(const std::string &name, int fd, uint64_t offset, size_t size);
+    void materialize();  // allocate() + fill()
+    void allocate();     // device storage only (call on the owning thread)
+    void fill();         // copy the pending sources in
     Buf get(const std::string &name) const;
     bool has(const std::string &name) const { return entries_.count(name) != 0; }
     size_t bytes() const { return total_; }
@@ -81,13 +87,20 @@ private:
         size_t offset;
         const void *src;
         size_t size;
+        int fd = -1;
+        uint64_t file_offset = 0;
     };
+    friend void materialize_parallel(const std::vector<TensorBank *> &banks, unsigned threads);
     std::string name_;
     std::vector<Pending> pending_;
     std::map<std::string, Buf> entries_;
     size_t total_ = 0;
     DeviceBuffer storage_;
 };
+
+// Allocate every bank, then copy all pending sources with `threads` workers (<= 64 MB per job). Weight files are
+// read through their mappings, so several workers keep the disk queue busy (NVMe reads scale to ~4 streams).
+void materialize_parallel(const std::vector<TensorBank *> &banks, unsigned threads = 6);
 
 using Bindings = std::map<std::string, Buf>;
 

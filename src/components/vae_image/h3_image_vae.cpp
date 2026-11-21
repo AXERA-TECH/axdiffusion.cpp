@@ -1,6 +1,7 @@
 // Image VAE decoder (2D ViT, 24 layers) on the NPU, decoded in 256 px tiles and blended on the host.
 #include <algorithm>
 #include <cmath>
+#include <deque>
 
 #include "common.hpp"
 #include "h3_dit.hpp"
@@ -256,73 +257,89 @@ std::vector<uint8_t> Vae::decode(const std::vector<float> &latents, int h, int w
 
 std::unique_ptr<VaeWeights> load_vae_weights(const ModelDir &dir) {
     constexpr int C = kLatentChannels, H = 1024, HEADS = 16, HD = 64, LAYERS = 24;
+    double t0 = now_s();
     SafeTensors st(dir.file("vae/vae_bf16.safetensors"));
+    st.read_all({"decoder.", "post_quant_conv."});  // decoder only; permuted on the host, so read it in parallel
+    const double t_read = now_s() - t0;
     auto w = std::make_unique<VaeWeights>();
     w->bank = std::make_unique<TensorBank>("vae");
-    // Prepared tensors must outlive materialize().
-    std::vector<std::vector<uint8_t>> keep;
-    auto put_bf16 = [&](const std::string &name, const std::vector<float> &v) {
-        auto b = to_bf16(v);
-        keep.emplace_back(reinterpret_cast<uint8_t *>(b.data()), reinterpret_cast<uint8_t *>(b.data()) + b.size() * 2);
-        w->bank->add(name, keep.back().data(), keep.back().size());
+    // bf16 tensors go to the device straight from the mapping; only q/k/v interleaving and the gated-FFN half
+    // swap are row permutations (done on the bf16 bytes). Prepared tensors must outlive materialize_parallel().
+    std::deque<std::vector<uint16_t>> keep;  // deque: references stay valid while appending
+    auto bf16_of = [&](const std::string &name) -> const uint16_t * {
+        auto &t = st.get(name);
+        if (t.dtype == "BF16") return reinterpret_cast<const uint16_t *>(t.data);
+        keep.push_back(to_bf16(t));
+        return keep.back().data();
     };
-    auto put_f32 = [&](const std::string &name, const std::vector<float> &v) {
-        keep.emplace_back(reinterpret_cast<const uint8_t *>(v.data()),
-                          reinterpret_cast<const uint8_t *>(v.data()) + v.size() * 4);
-        w->bank->add(name, keep.back().data(), keep.back().size());
+    auto elems = [&](const std::string &name) { size_t n = 1; for (auto d : st.get(name).shape) n *= size_t(d); return n; };
+    auto put_bf16 = [&](const std::string &dst, const std::string &src) {
+        w->bank->add(dst, bf16_of(src), elems(src) * 2);
     };
-    auto f = [&](const std::string &name) { return to_f32(st.get(name)); };
-    keep.reserve(16 + LAYERS * 12);
+    std::deque<std::vector<float>> keep_f32;
+    auto put_f32 = [&](const std::string &dst, const std::string &src) {
+        keep_f32.push_back(to_f32(st.get(src)));
+        w->bank->add(dst, keep_f32.back().data(), keep_f32.back().size() * 4);
+    };
 
-    put_bf16("post_quant_weight", f("post_quant_conv.weight"));  // [24,24,1,1] -> [24,24]
-    put_bf16("post_quant_bias", f("post_quant_conv.bias"));
-    put_bf16("embed_weight", f("decoder.proj_in.weight"));
-    put_bf16("embed_bias", f("decoder.proj_in.bias"));
-    put_bf16("register_tokens", f("decoder.register_tokens"));   // [1,4,1024] -> [4,1024]
-    put_f32("norm_weight", f("decoder.norm_out.weight"));
-    put_f32("norm_bias", f("decoder.norm_out.bias"));
-    put_bf16("proj_weight", f("decoder.proj_out.weight"));
-    put_bf16("proj_bias", f("decoder.proj_out.bias"));
+    put_bf16("post_quant_weight", "post_quant_conv.weight");  // [24,24,1,1] -> [24,24]
+    put_bf16("post_quant_bias", "post_quant_conv.bias");
+    put_bf16("embed_weight", "decoder.proj_in.weight");
+    put_bf16("embed_bias", "decoder.proj_in.bias");
+    put_bf16("register_tokens", "decoder.register_tokens");  // [1,4,1024] -> [4,1024]
+    put_f32("norm_weight", "decoder.norm_out.weight");
+    put_f32("norm_bias", "decoder.norm_out.bias");
+    put_bf16("proj_weight", "decoder.proj_out.weight");
+    put_bf16("proj_bias", "decoder.proj_out.bias");
 
     for (int l = 0; l < LAYERS; ++l) {
         std::string p = "decoder.transformer_blocks." + std::to_string(l);
         std::string k = std::to_string(l) + ".";
         // q/k/v rows interleaved per head: [h0 q, h0 k, h0 v, h1 q, ...]
-        auto q = f(p + ".attn.to_q.weight"), kk = f(p + ".attn.to_k.weight"), v = f(p + ".attn.to_v.weight");
-        auto qb = f(p + ".attn.to_q.bias"), kb = f(p + ".attn.to_k.bias"), vb = f(p + ".attn.to_v.bias");
-        std::vector<float> qkv(size_t(3) * H * H), qkvb(3 * H);
+        const uint16_t *src_w[3] = {bf16_of(p + ".attn.to_q.weight"), bf16_of(p + ".attn.to_k.weight"),
+                                    bf16_of(p + ".attn.to_v.weight")};
+        const uint16_t *src_b[3] = {bf16_of(p + ".attn.to_q.bias"), bf16_of(p + ".attn.to_k.bias"),
+                                    bf16_of(p + ".attn.to_v.bias")};
+        keep.emplace_back(size_t(3) * H * H);
+        auto &qkv = keep.back();
+        keep.emplace_back(size_t(3) * H);
+        auto &qkvb = keep.back();
         for (int h = 0; h < HEADS; ++h)
             for (int part = 0; part < 3; ++part) {
-                const auto &src = part == 0 ? q : part == 1 ? kk : v;
-                const auto &srcb = part == 0 ? qb : part == 1 ? kb : vb;
                 size_t dst_row = size_t(h) * 3 * HD + size_t(part) * HD;
-                std::memcpy(&qkv[dst_row * H], &src[size_t(h) * HD * H], size_t(HD) * H * 4);
-                std::memcpy(&qkvb[dst_row], &srcb[size_t(h) * HD], HD * 4);
+                std::memcpy(&qkv[dst_row * H], src_w[part] + size_t(h) * HD * H, size_t(HD) * H * 2);
+                std::memcpy(&qkvb[dst_row], src_b[part] + size_t(h) * HD, HD * 2);
             }
         // gated FFN: swap the two halves of the first projection
-        auto w1 = f(p + ".ff.net.0.proj.weight"), b1 = f(p + ".ff.net.0.proj.bias");
-        size_t half_rows = w1.size() / H / 2;
-        std::vector<float> w1s(w1.size()), b1s(b1.size());
-        std::memcpy(w1s.data(), &w1[half_rows * H], half_rows * H * 4);
-        std::memcpy(&w1s[half_rows * H], w1.data(), half_rows * H * 4);
-        std::memcpy(b1s.data(), &b1[half_rows], half_rows * 4);
-        std::memcpy(&b1s[half_rows], b1.data(), half_rows * 4);
+        const std::string w1n = p + ".ff.net.0.proj.weight", b1n = p + ".ff.net.0.proj.bias";
+        const uint16_t *w1 = bf16_of(w1n), *b1 = bf16_of(b1n);
+        const size_t w1_elems = elems(w1n), half_rows = w1_elems / H / 2;
+        keep.emplace_back(w1_elems);
+        auto &w1s = keep.back();
+        std::memcpy(w1s.data(), w1 + half_rows * H, half_rows * H * 2);
+        std::memcpy(&w1s[half_rows * H], w1, half_rows * H * 2);
+        keep.emplace_back(2 * half_rows);
+        auto &b1s = keep.back();
+        std::memcpy(b1s.data(), b1 + half_rows, half_rows * 2);
+        std::memcpy(&b1s[half_rows], b1, half_rows * 2);
 
-        put_f32(k + "norm1", f(p + ".norm1.weight"));
-        put_bf16(k + "qkv_weight", qkv);
-        put_bf16(k + "qkv_bias", qkvb);
-        put_bf16(k + "out_weight", f(p + ".attn.to_out.0.weight"));
-        put_bf16(k + "out_bias", f(p + ".attn.to_out.0.bias"));
-        put_f32(k + "scale1", f(p + ".scale1"));
-        put_f32(k + "norm2", f(p + ".norm2.weight"));
-        put_bf16(k + "w1_weight", w1s);
-        put_bf16(k + "w1_bias", b1s);
-        put_bf16(k + "w2_weight", f(p + ".ff.net.2.weight"));
-        put_bf16(k + "w2_bias", f(p + ".ff.net.2.bias"));
-        put_f32(k + "scale2", f(p + ".scale2"));
+        put_f32(k + "norm1", p + ".norm1.weight");
+        w->bank->add(k + "qkv_weight", qkv.data(), qkv.size() * 2);
+        w->bank->add(k + "qkv_bias", qkvb.data(), qkvb.size() * 2);
+        put_bf16(k + "out_weight", p + ".attn.to_out.0.weight");
+        put_bf16(k + "out_bias", p + ".attn.to_out.0.bias");
+        put_f32(k + "scale1", p + ".scale1");
+        put_f32(k + "norm2", p + ".norm2.weight");
+        w->bank->add(k + "w1_weight", w1s.data(), w1s.size() * 2);
+        w->bank->add(k + "w1_bias", b1s.data(), b1s.size() * 2);
+        put_bf16(k + "w2_weight", p + ".ff.net.2.weight");
+        put_bf16(k + "w2_bias", p + ".ff.net.2.bias");
+        put_f32(k + "scale2", p + ".scale2");
     }
     (void)C;
-    w->bank->materialize();
+    const double t_prep = now_s() - t0 - t_read;
+    materialize_parallel({w->bank.get()});
+    AXD_LOG("VAE weights: read %.1f s, prepare %.1f s, upload %.1f s", t_read, t_prep, now_s() - t0 - t_read - t_prep);
     return w;
 }
 

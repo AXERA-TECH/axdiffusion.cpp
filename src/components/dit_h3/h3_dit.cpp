@@ -20,6 +20,8 @@ constexpr int kAdalnRows = 3;
 // out[rows, N] (bf16) = x[rows, K] @ W[N, K]^T + b, FP32 accumulation, threaded over N.
 void host_linear(const float *x, int rows, int K, const std::vector<float> &W, const std::vector<float> &b, int N,
                  uint16_t *out) {
+    // Threaded over output columns; each weight row stays in L1 while all rows stream past it. On the board's
+    // Cortex-A55 cores this simple order beat row- and column-blocked variants.
     parallel_for(size_t(N), [&](size_t n0, size_t n1) {
         for (size_t n = n0; n < n1; ++n) {
             const float *w = &W[n * size_t(K)];
@@ -32,15 +34,6 @@ void host_linear(const float *x, int rows, int K, const std::vector<float> &W, c
             }
         }
     });
-}
-
-std::string shape_key(int padded) {
-    switch (padded) {
-        case 1280: return "1024x1024 short";
-        case 1536: return "1024x1024 arbitrary";
-        case 4608: return "2048x2048";
-    }
-    fail("no compiled DiT kernel for padded length " + std::to_string(padded));
 }
 
 }  // namespace
@@ -57,14 +50,17 @@ struct RefinerWs {
 };
 
 Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
-    if (const char *e = std::getenv("AXD_SYNC")) async_ = std::string(e) != "1";
     // Sequence tiers come from the model directory's manifest ("... padded N ..."), so new tiers
     // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
     auto load = [&](const std::string &purpose, std::map<int, std::unique_ptr<Model>> &into) {
         auto shapes = dir.tier_shapes(purpose, "padded ");
         for (auto &kv : dir.tiers(purpose, "padded ")) {
             into[kv.first] = std::make_unique<Model>(kv.second);
-            granule_[into[kv.first].get()] = ModelDir::shape_int(shapes[kv.first], "granule ", 512);
+            const Model *m = into[kv.first].get();
+            if (!m->has_input("sequence_bounds")) fail(purpose + " tier " + std::to_string(kv.first) + " has no runtime sequence bounds");
+            const int g = ModelDir::shape_int(shapes[kv.first], "granule ", 0);
+            if (g <= 0) fail(purpose + " tier " + std::to_string(kv.first) + ": manifest shape must state 'granule N'");
+            granule_[m] = g;
         }
     };
     load("dit-block", block_);
@@ -76,7 +72,11 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
     for (int r : {32, 96, 128, 192, 256}) load("dit-block-lora-r" + std::to_string(r), lora_block_[r]);
     for (auto it = lora_block_.begin(); it != lora_block_.end();)
         it = it->second.empty() ? lora_block_.erase(it) : std::next(it);
-    for (auto &kv : dir.tiers("dit-refiner", "")) refiner_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-refiner", "")) {
+        refiner_[kv.first] = std::make_unique<Model>(kv.second);
+        if (!refiner_[kv.first]->has_input("sequence_bounds"))
+            fail("dit-refiner " + std::to_string(kv.first) + "-row kernel has no runtime sequence bounds");
+    }
     for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first] = std::make_unique<Model>(kv.second);
     for (auto &kv : block_)
         if (!final_.count(kv.first)) fail("DiT tier " + std::to_string(kv.first) + " has a block but no final kernel");
@@ -90,7 +90,7 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
 
 Dit::~Dit() = default;
 
-int Dit::pick_tier(int used, bool static_ok, int lora_rank, bool edit, bool *is_static) const {
+int Dit::pick_tier(int used, int lora_rank, bool edit) const {
     const std::map<int, std::unique_ptr<Model>> *cands = &block_;
     if (edit) {
         cands = &edit_block_;
@@ -103,12 +103,7 @@ int Dit::pick_tier(int used, bool static_ok, int lora_rank, bool edit, bool *is_
     for (auto &kv : *cands) {
         const int P = kv.first;
         if (P < used || !finals.count(P)) continue;
-        const Model *m = kv.second.get();
-        const bool runtime = m->has_input("sequence_bounds");
-        if (runtime ? P - granule_.at(m) < used : static_ok) {
-            if (is_static) *is_static = !runtime;
-            return P;
-        }
+        if (P - granule_.at(kv.second.get()) < used) return P;
     }
     return 0;
 }
@@ -122,7 +117,7 @@ int Dit::max_text_rows(int image_rows, int lora_rank) const {
     }
     int best = 0;
     for (auto &kv : *cands)
-        if (final_.count(kv.first) && kv.second->has_input("sequence_bounds")) best = std::max(best, kv.first - image_rows);
+        if (final_.count(kv.first)) best = std::max(best, kv.first - image_rows);
     return best;
 }
 
@@ -156,7 +151,6 @@ DitShape &Dit::shape(int padded) {
     s->combined = DeviceBuffer(size_t(padded) * 4, "dit-combined");
     s->rope = DeviceBuffer(size_t(padded) * 96 * 2, "dit-rope");
     s->positions = DeviceBuffer(size_t(padded) * 8 * 4, "dit-positions");
-    // runtime sequence bounds; the 1280 base kernel ignores them, its LoRA variant reads them
     s->bounds = DeviceBuffer(3 * 4, "dit-bounds");
     s->inverse.buf().fill_zero();
     // positions: arange(padded) repeated 8 times per row
@@ -185,7 +179,7 @@ RefinerWs &Dit::refiner_ws(int rows) {
     r->attn_ws = DeviceBuffer(kv, "ref-attn-ws");
     r->q_ws = DeviceBuffer(kv, "ref-q");
     r->normalized = DeviceBuffer(rows * row, "ref-normalized");
-    if (refiner_.at(rows)->has_input("sequence_bounds")) r->bounds = DeviceBuffer(12, "ref-bounds");
+    r->bounds = DeviceBuffer(12, "ref-bounds");
     slot = std::move(r);
     return *slot;
 }
@@ -202,12 +196,9 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
         if (int(edit->text_tags.size()) != text_rows || int(edit->positions.size()) != used_)
             fail("edit layout does not match the sequence");
     }
-    // static kernels are compiled for exactly this geometry
-    const bool fast = latent_h == 64 && latent_w == 64 && text_rows == 51;
     if (lora && !lora_block_.count(lora->rank))
         fail("no rank-" + std::to_string(lora->rank) + " LoRA block kernels in this model directory");
-    static_ = false;
-    padded_ = pick_tier(used_, fast, lora ? lora->rank : 0, edit != nullptr, &static_);
+    padded_ = pick_tier(used_, lora ? lora->rank : 0, edit != nullptr);
     const auto &cands = edit ? edit_block_ : lora ? lora_block_.at(lora->rank) : block_;
     if (!padded_) {
         std::string have;
@@ -222,19 +213,20 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     std::vector<float> xt(size_t(text_rows) * kDitTextDim);
     for (size_t i = 0; i < xt.size(); ++i) xt[i] = bf16_to_f32(text_hidden[i]);
     std::vector<uint16_t> proj(size_t(text_rows) * kDitHidden);
+    const double tl = now_s();
     host_linear(xt.data(), text_rows, kDitTextDim, w_.context_w, w_.context_b, kDitHidden, proj.data());
+    AXD_LOG("text projection %d rows: %.2f s", text_rows, now_s() - tl);
 
     // 2) token refiner (2 layers) + RMSNorm on the NPU
     int rows = 0;
-    if (static_ && refiner_.count(64)) rows = 64;  // static 64-row refiner pairs with the static block kernel
     // runtime refiner kernels accept (rows - 512, rows] valid text rows
     for (auto it = refiner_.begin(); !rows && it != refiner_.end(); ++it)
-        if (it->first >= text_rows && it->first != 64 && it->first - 512 < text_rows) rows = it->first;
+        if (it->first >= text_rows && it->first - 512 < text_rows) rows = it->first;
     if (!rows) fail("no token refiner tier for " + std::to_string(text_rows) + " text rows");
     auto &r = refiner_ws(rows);
     r.x[0].buf().fill_zero();
     r.x[0].buf().upload(proj.data(), proj.size() * 2);
-    if (r.bounds.size()) {
+    {
         int32_t b[3] = {0, text_rows, rows};
         r.bounds.buf().upload(b, sizeof(b));
     }
@@ -260,7 +252,7 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
                        {"attention_workspace", r.attn_ws},
                        {"mlp_workspace", r.mlp},
                        {"q_workspace", r.q_ws}};
-        if (r.bounds.size()) in["sequence_bounds"] = r.bounds;
+        in["sequence_bounds"] = r.bounds;
         refiner_[rows]->run(in, {{"output", tgt},
                                  {"attention_output", r.attention_output},
                                  {"ffn_workspace", r.ffn},
@@ -314,7 +306,7 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
         host_linear(edit->reference_rows.data(), reference_rows_, kPatchDim, w_.proj_in_w, w_.proj_in_b, kDitHidden,
                     reference_proj_.data());
     }
-    if (s.bounds.size()) {
+    {
         int32_t b[3] = {0, used_, padded_};
         s.bounds.buf().upload(b, sizeof(b));
     }
@@ -324,7 +316,7 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
 
 void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const LoraSet *lora) {
     auto &s = shape(padded_);
-    if (async_ && !stream_) stream_ = std::make_unique<Stream>();  // created on the NPU worker thread
+    if (!stream_) stream_ = std::make_unique<Stream>();  // created on the NPU worker thread
     const size_t row = size_t(kDitHidden) * 2;
     // image rows: patch projection 96 -> 5376 on the host
     std::vector<uint16_t> image(size_t(image_tokens_) * kDitHidden);
@@ -376,7 +368,7 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
                        {"v_workspace", s.v_ws},
                        {"attention_workspace", s.attn_ws},
                        {"q_workspace", s.q_ws}};
-        if (s.bounds.size()) in["sequence_bounds"] = s.bounds;
+        in["sequence_bounds"] = s.bounds;
         Model *model = edit_ ? edit_block_.at(padded_).get() : block_[padded_].get();
         if (lora) {
             model = lora_block_[lora->rank][padded_].get();
@@ -387,22 +379,15 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
                                {"attention_output", s.attention_output},
                                {"residual_workspace", s.residual},
                                {"ffn_workspace", s.ffn}};
-        if (async_)
-            model->submit(*stream_, in, outs);
-        else
-            model->run(in, outs);
+        model->submit(*stream_, in, outs);
         cur = 1 - cur;
         t.block_seconds.push_back(now_s() - t0);
     }
     auto final_run = [&](const Bindings &in, const Bindings &out) {
-        if (async_) {
-            (edit_ ? edit_final_ : final_).at(padded_)->submit(*stream_, in, out);
-            double t0 = now_s();
-            stream_->sync();  // the velocity is read on the host next
-            t.sync_seconds += now_s() - t0;
-        } else {
-            (edit_ ? edit_final_ : final_).at(padded_)->run(in, out);
-        }
+        (edit_ ? edit_final_ : final_).at(padded_)->submit(*stream_, in, out);
+        double t0 = now_s();
+        stream_->sync();  // the velocity is read on the host next
+        t.sync_seconds += now_s() - t0;
     };
     final_run({{"x", s.x[cur]},
                           {"inverse_indices", s.inverse},
@@ -444,7 +429,7 @@ Buf DitWeights::adaln_slot(int step, int layer, int slot, bool edit) const {
     const int rows = edit ? 6 : 3;
     const size_t slot_bytes = size_t(rows) * kDitHidden * 2;
     size_t index = (size_t(step) * kDitLayers + layer) * 6 + slot;
-    return (edit ? adaln_edit_blocks : adaln_blocks).buf().view(index * slot_bytes, slot_bytes);
+    return (edit ? *adaln_edit : *adaln).get("blocks").view(index * slot_bytes, slot_bytes);
 }
 Buf DitWeights::adaln_input(int step, bool edit) const {
     const size_t n = size_t(edit ? 2 : 1) * 2688 * 2;
@@ -461,59 +446,59 @@ Buf DitWeights::final_scale(int step, bool edit) const {
 
 std::unique_ptr<DitWeights> load_dit_weights(const ModelDir &dir) {
     auto w = std::make_unique<DitWeights>();
-    {
-        SafeTensors st(dir.file("dit/shared.safetensors"));
-        w->shared = std::make_unique<TensorBank>("dit-shared");
-        for (auto &name : st.names()) {
+    // Every device tensor (shared layers, AdaLN tables, 50 blocks) is read from its file range by parallel
+    // workers in one pass; the files stay open until then.
+    std::vector<std::unique_ptr<SafeTensors>> files;
+    std::vector<TensorBank *> banks;
+    auto add_all = [&](TensorBank &bank, SafeTensors &st, const std::vector<std::string> &names) {
+        for (auto &name : names) {
             auto &t = st.get(name);
-            w->shared->add(name, t.data, t.nbytes);
+            bank.add_file(name, st.fd(), st.file_offset(t), t.nbytes);
         }
-        w->shared->materialize();
+        banks.push_back(&bank);
+    };
+    files.push_back(std::make_unique<SafeTensors>(dir.file("dit/shared.safetensors")));
+    {
+        auto &st = *files.back();
+        w->shared = std::make_unique<TensorBank>("dit-shared");
+        add_all(*w->shared, st, st.names());
         w->proj_in_w = to_f32(st.get("proj_in.weight"));
         w->proj_in_b = to_f32(st.get("proj_in.bias"));
         w->context_w = to_f32(st.get("context.weight"));
         w->context_b = to_f32(st.get("context.bias"));
     }
+    files.push_back(std::make_unique<SafeTensors>(dir.file("dit/adaln.safetensors")));
     {
-        SafeTensors st(dir.file("dit/adaln.safetensors"));
+        auto &st = *files.back();
+        if (st.get("blocks").nbytes != size_t(kSteps) * kDitLayers * 6 * 3 * kDitHidden * 2)
+            fail("unexpected adaln table size");  // [6,50,6,3,5376] bf16
         w->adaln = std::make_unique<TensorBank>("dit-adaln");
-        for (const char *name : {"adaln_input", "final_shift", "final_scale"}) {
-            auto &t = st.get(name);
-            w->adaln->add(name, t.data, t.nbytes);
-        }
-        w->adaln->materialize();
-        auto &blocks = st.get("blocks");  // [6,50,6,3,5376] bf16
-        if (blocks.nbytes != size_t(kSteps) * kDitLayers * 6 * 3 * kDitHidden * 2) fail("unexpected adaln table size");
-        w->adaln_blocks = DeviceBuffer(blocks.nbytes, "dit-adaln-blocks");
-        w->adaln_blocks.buf().upload(blocks.data, blocks.nbytes);
+        add_all(*w->adaln, st, {"adaln_input", "final_shift", "final_scale", "blocks"});
     }
     if (dir.exists("dit/adaln_edit.safetensors")) {
-        SafeTensors st(dir.file("dit/adaln_edit.safetensors"));
+        files.push_back(std::make_unique<SafeTensors>(dir.file("dit/adaln_edit.safetensors")));
+        auto &st = *files.back();
+        for (const char *name : {"adaln_input", "final_shift", "final_scale", "blocks"})
+            if (st.get(name).dtype != "BF16") fail(std::string("adaln_edit ") + name + " must be bf16");
+        if (st.get("blocks").nbytes != size_t(kSteps) * kDitLayers * 6 * 6 * kDitHidden * 2)
+            fail("unexpected adaln_edit size");  // [6,50,6,6,5376] bf16
         w->adaln_edit = std::make_unique<TensorBank>("dit-adaln-edit");
-        for (const char *name : {"adaln_input", "final_shift", "final_scale"}) {
-            auto &t = st.get(name);
-            if (t.dtype != "BF16") fail(std::string("adaln_edit ") + name + " must be bf16");
-            w->adaln_edit->add(name, t.data, t.nbytes);
-        }
-        w->adaln_edit->materialize();
-        auto &blocks = st.get("blocks");  // [6,50,6,6,5376] bf16
-        if (blocks.nbytes != size_t(kSteps) * kDitLayers * 6 * 6 * kDitHidden * 2) fail("unexpected adaln_edit size");
-        w->adaln_edit_blocks = DeviceBuffer(blocks.nbytes, "dit-adaln-edit-blocks");
-        w->adaln_edit_blocks.buf().upload(blocks.data, blocks.nbytes);
+        add_all(*w->adaln_edit, st, {"adaln_input", "final_shift", "final_scale", "blocks"});
     }
+    // 50 block files: map them all, then copy with several workers (disk reads scale with parallel streams)
     for (int i = 0; i < kDitLayers; ++i) {
         char rel[64];
         std::snprintf(rel, sizeof(rel), "dit/blocks/block%02d.safetensors", i);
-        SafeTensors st(dir.file(rel));
+        files.push_back(std::make_unique<SafeTensors>(dir.file(rel)));
         auto bank = std::make_unique<TensorBank>("dit-block-" + std::to_string(i));
-        for (auto &name : st.names()) {
-            auto &t = st.get(name);
-            bank->add(name, t.data, t.nbytes);
+        for (auto &name : files.back()->names()) {
+            auto &t = files.back()->get(name);
+            bank->add_file(name, files.back()->fd(), files.back()->file_offset(t), t.nbytes);
         }
-        bank->materialize();
+        banks.push_back(bank.get());
         w->blocks.push_back(std::move(bank));
-        if (i % 10 == 9) AXD_LOG("DiT blocks loaded: %d/50", i + 1);
     }
+    materialize_parallel(banks);
     return w;
 }
 

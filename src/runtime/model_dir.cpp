@@ -17,19 +17,14 @@ bool ModelDir::exists(const std::string &rel) const {
 
 ModelDir::ModelDir(const std::string &root) : root_(root) {
     std::ifstream f(root + "/axmodels/manifest.json");
-    if (!f) fail("not a MiniMax-H3-Image-AX8860 directory (axmodels/manifest.json missing): " + root);
+    if (!f) fail("not an axdiffusion model directory (axmodels/manifest.json missing): " + root);
     auto j = nlohmann::json::parse(f);
     for (auto &m : j.at("models"))
         models_.push_back({m.at("purpose").get<std::string>(), m.at("shape").get<std::string>(),
                            m.at("file").get<std::string>()});
     std::ifstream d(root + "/axdiffusion.json");
-    if (d) {
-        arch_ = nlohmann::json::parse(d).at("arch").get<std::string>();
-    } else if (exists("dit/shared.safetensors") && exists("vae/vae_bf16.safetensors")) {
-        arch_ = "minimax-h3-image";  // release layout from before axdiffusion.json existed
-    } else {
-        fail("cannot tell the model architecture: " + root + "/axdiffusion.json is missing");
-    }
+    if (!d) fail("not an axdiffusion model directory (axdiffusion.json missing): " + root);
+    arch_ = nlohmann::json::parse(d).at("arch").get<std::string>();
 }
 
 std::string ModelDir::axmodel(const std::string &purpose, const std::string &shape_prefix) const {

@@ -1,7 +1,12 @@
 #include "npu.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <cstring>
@@ -33,6 +38,10 @@ void memcpy_chunked(void *dst, const void *src, size_t n, axclrtMemcpyKind kind)
 }  // namespace
 
 // ---------------------------------------------------------------- Runtime
+namespace {
+void *g_runtime_ctx = nullptr;  // the process-wide runtime's context, for helper threads
+}
+
 Runtime::Runtime(int device) : device_(device) {
     check(axclInit(""), "axclInit");
     uint32_t count = 0;
@@ -43,6 +52,14 @@ Runtime::Runtime(int device) : device_(device) {
     axclrtContext ctx = nullptr;
     check(axclrtGetCurrentContext(&ctx), "axclrtGetCurrentContext");
     ctx_ = ctx;
+    g_runtime_ctx = ctx;
+}
+
+void Runtime::bind_current_thread() {
+    thread_local const void *bound = nullptr;
+    if (!g_runtime_ctx || bound == g_runtime_ctx) return;
+    check(axclrtSetCurrentContext(axclrtContext(g_runtime_ctx)), "axclrtSetCurrentContext");
+    bound = g_runtime_ctx;
 }
 
 void Runtime::bind_thread() const {
@@ -134,16 +151,83 @@ void TensorBank::add(const std::string &name, const void *src, size_t size) {
     total_ = offset + size;
 }
 
-void TensorBank::materialize() {
+void TensorBank::add_file(const std::string &name, int fd, uint64_t file_offset, size_t size) {
+    if (storage_.size()) fail("tensor bank " + name_ + " already materialized");
+    size_t offset = (total_ + 255) / 256 * 256;
+    pending_.push_back({name, offset, nullptr, size, fd, file_offset});
+    total_ = offset + size;
+}
+
+void TensorBank::allocate() {
     if (storage_.size()) return;
     storage_ = DeviceBuffer(total_, name_);
     Buf all = storage_.buf();
-    for (auto &p : pending_) {
-        Buf b = all.view(p.offset, p.size);
-        if (p.src) b.upload(p.src, p.size);
-        entries_[p.name] = b;
+    for (auto &p : pending_) entries_[p.name] = all.view(p.offset, p.size);
+}
+
+void TensorBank::fill() {
+    if (!pending_.empty()) materialize_parallel({this}, 1);
+}
+
+void TensorBank::materialize() {
+    if (storage_.size() && pending_.empty()) return;
+    materialize_parallel({this}, 1);
+}
+
+void materialize_parallel(const std::vector<TensorBank *> &banks, unsigned threads) {
+    struct Job {
+        Buf dst;
+        const uint8_t *src;  // memory source, or
+        int fd;              // file source
+        uint64_t file_offset;
+        size_t n;
+    };
+    constexpr size_t kJob = 16u << 20;  // one pread + one H2D copy
+    std::vector<Job> jobs;
+    for (auto *b : banks) {
+        b->allocate();
+        Buf all = b->storage_.buf();
+        for (auto &p : b->pending_) {
+            if (!p.src && p.fd < 0) continue;
+            for (size_t o = 0; o < p.size; o += kJob) {
+                size_t n = std::min(kJob, p.size - o);
+                jobs.push_back({all.view(p.offset + o, n), p.src ? static_cast<const uint8_t *>(p.src) + o : nullptr,
+                                p.fd, p.file_offset + o, n});
+            }
+        }
     }
-    pending_.clear();
+    std::atomic<size_t> next{0};
+    std::string error;
+    std::mutex error_mu;
+    auto worker = [&] {
+        try {
+            Runtime::bind_current_thread();
+            std::vector<uint8_t> buf;
+            for (size_t i; (i = next++) < jobs.size();) {
+                const Job &j = jobs[i];
+                if (j.src) {
+                    j.dst.upload(j.src, j.n);
+                    continue;
+                }
+                buf.resize(kJob);
+                for (size_t done = 0; done < j.n;) {
+                    ssize_t r = ::pread(j.fd, buf.data() + done, j.n - done, off_t(j.file_offset + done));
+                    if (r <= 0) fail("weight file read failed");
+                    done += size_t(r);
+                }
+                j.dst.upload(buf.data(), j.n);
+            }
+        } catch (const std::exception &e) {
+            std::lock_guard<std::mutex> lk(error_mu);
+            if (error.empty()) error = e.what();
+            next = jobs.size();
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < std::max(1u, threads); ++t) pool.emplace_back(worker);
+    for (auto &t : pool) t.join();
+    if (!error.empty()) fail(error);
+    for (auto *b : banks) b->pending_.clear();
 }
 
 Buf TensorBank::get(const std::string &name) const {
@@ -162,20 +246,32 @@ Model::Model(const std::string &path) : path_(path) {
     if (bytes <= (64u << 20)) {
         check(axclrtEngineLoadFromFile(path.c_str(), &model_id_), "load " + path);
     } else {
-        std::FILE *f = std::fopen(path.c_str(), "rb");
-        if (!f) fail("cannot open " + path);
-        DeviceBuffer staging(bytes, "model-staging");
-        std::vector<uint8_t> chunk(kCopyChunk);
-        for (size_t done = 0; done < bytes;) {
-            size_t n = std::min(kCopyChunk, bytes - done);
-            if (std::fread(chunk.data(), 1, n, f) != n) {
-                std::fclose(f);
-                fail("short read: " + path);
+        // read with several workers (one stream is ~0.7 GB/s on the board's NVMe, four ~1.9 GB/s), then upload
+        std::unique_ptr<uint8_t[]> host(new uint8_t[bytes]);
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) fail("cannot open " + path);
+        std::atomic<size_t> next{0};
+        std::atomic<bool> bad{false};
+        auto worker = [&] {
+            for (size_t o; (o = next.fetch_add(kCopyChunk)) < bytes;) {
+                const size_t end = std::min(bytes, o + kCopyChunk);
+                for (size_t p = o; p < end;) {
+                    ssize_t r = ::pread(fd, host.get() + p, end - p, off_t(p));
+                    if (r <= 0) {
+                        bad = true;
+                        return;
+                    }
+                    p += size_t(r);
+                }
             }
-            staging.buf().upload(chunk.data(), n, done);
-            done += n;
-        }
-        std::fclose(f);
+        };
+        std::vector<std::thread> pool;
+        for (int t = 0; t < 4; ++t) pool.emplace_back(worker);
+        for (auto &t : pool) t.join();
+        ::close(fd);
+        if (bad) fail("short read: " + path);
+        DeviceBuffer staging(bytes, "model-staging");
+        staging.buf().upload(host.get(), bytes);
         check(axclrtEngineLoadFromMem(staging.buf().ptr, bytes, &model_id_), "load (from device memory) " + path);
     }
     check(axclrtEngineCreateContext(model_id_, &context_id_), "CreateContext " + path);

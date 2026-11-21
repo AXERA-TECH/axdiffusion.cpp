@@ -10,8 +10,7 @@ namespace axd {
 class ModelDir {
 public:
     explicit ModelDir(const std::string &root);
-    // Architecture id from axdiffusion.json ("minimax-h3-image", ...). Older directories without the file are
-    // recognized by their layout.
+    // Architecture id from axdiffusion.json ("minimax-h3-image", ...).
     const std::string &arch() const { return arch_; }
     std::string axmodel(const std::string &purpose, const std::string &shape_prefix = "") const;
     bool has_axmodel(const std::string &purpose, const std::string &shape_prefix = "") const;

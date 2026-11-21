@@ -30,11 +30,10 @@ struct DitWeights {
     std::vector<std::unique_ptr<TensorBank>> blocks;
     std::vector<float> proj_in_w, proj_in_b;  // [5376,96], [5376] (host projection)
     std::vector<float> context_w, context_b;  // [5376,5120], [5376]
-    DeviceBuffer adaln_blocks;                // [6,50,6,3,5376] bf16
-    // Reference editing (M=2: [t_i, 0.999] per step), optional: blocks [6,50,6,6,5376], input [6,2,2688],
-    // final [6,2,5376].
+    // adaln: blocks [6,50,6,3,5376], input [6,2688], final [6,5376] (bf16).
+    // adaln_edit (reference editing, M=2: [t_i, 0.999] per step), optional: blocks [6,50,6,6,5376],
+    // input [6,2,2688], final [6,2,5376].
     std::unique_ptr<TensorBank> adaln_edit;
-    DeviceBuffer adaln_edit_blocks;
     Buf adaln_slot(int step, int layer, int slot, bool edit = false) const;
     Buf adaln_input(int step, bool edit = false) const;
     Buf final_shift(int step, bool edit = false) const;
@@ -78,9 +77,8 @@ public:
     std::vector<int> lora_ranks() const;  // rank tiers that have LoRA block kernels
     // Longest text (rows) any runtime tier accepts next to `image_rows` image rows (LoRA rank tier if rank > 0).
     int max_text_rows(int image_rows, int lora_rank = 0) const;
-    // Smallest tier whose kernel accepts `used` rows (0 = none). static_ok: the request matches the static
-    // kernels' geometry (1024x1024, 51 text rows). lora_rank 0 = base kernels.
-    int pick_tier(int used, bool static_ok, int lora_rank, bool edit, bool *is_static = nullptr) const;
+    // Smallest tier whose kernel accepts `used` rows (0 = none). lora_rank 0 = base kernels.
+    int pick_tier(int used, int lora_rank, bool edit) const;
     int used() const { return used_; }
     int padded() const { return padded_; }
 
@@ -97,12 +95,10 @@ private:
     int reference_rows_ = 0;
     std::vector<uint16_t> reference_proj_;  // [reference_rows,5376] bf16, projected once per request
     std::map<int, std::map<int, std::unique_ptr<Model>>> lora_block_;  // [rank][padded]
-    // Runtime kernels accept used rows in (padded - granule, padded]; the granule comes from the manifest
-    // ("granule N", default 512). Kernels without a sequence_bounds input are static (1024x1024, 51-token prompt).
+    // Every tier kernel takes runtime sequence bounds and accepts used rows in (padded - granule, padded]; the
+    // granule is part of the manifest shape ("granule N").
     std::map<const Model *, int> granule_;
-    std::unique_ptr<Stream> stream_;  // block + final launches of a step are queued here (AXD_SYNC=1: synchronous)
-    bool async_ = true;
-    bool static_ = false;  // the selected kernel is static
+    std::unique_ptr<Stream> stream_;  // block + final launches of a step are queued here
     std::map<int, std::unique_ptr<DitShape>> shapes_;
     std::map<int, std::unique_ptr<RefinerWs>> refiners_;
     Buf refined_text_;

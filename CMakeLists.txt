@@ -25,7 +25,7 @@ target_include_directories(axdcore PUBLIC
   src/server
   third_party ${AXCL_ROOT}/include)
 target_link_directories(axdcore PUBLIC ${AXCL_ROOT}/lib)
-target_link_libraries(axdcore PUBLIC axcl_rt pthread)
+target_link_libraries(axdcore PUBLIC axcl_rt pthread ${CMAKE_DL_LIBS})
 
 foreach(tool axdiffusion-cli axdiffusion-server)
   string(REPLACE "-" "_" src ${tool})
