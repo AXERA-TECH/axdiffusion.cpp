@@ -6,6 +6,7 @@
 //   OpenAI Images        POST /v1/images/generations   POST /v1/images/edits   GET /v1/models
 //   A1111 / SD WebUI     POST /sdapi/v1/txt2img   POST /sdapi/v1/img2img   GET /sdapi/v1/sd-models  GET /sdapi/v1/options
 // Others:
+//   GET /                       built-in web UI
 //   GET /health                 readiness, CMM usage
 //   GET /files/<name>           images returned with response_format=url
 //
@@ -23,6 +24,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "pipeline.hpp"
+#include "web_ui.hpp"
 
 using nlohmann::json;
 
@@ -183,6 +185,14 @@ int main(int argc, char **argv) {
     httplib::Server srv;
     srv.set_read_timeout(600, 0);
     srv.set_write_timeout(600, 0);
+
+    // Browser clients (the built-in page, other web front ends) may call the API cross-origin.
+    srv.set_default_headers({{"Access-Control-Allow-Origin", "*"},
+                             {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
+                             {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
+    srv.Options(R"(.*)", [](const httplib::Request &, httplib::Response &res) { res.status = 204; });
+    for (const char *path : {"/", "/index.html"})
+        srv.Get(path, [](const httplib::Request &, httplib::Response &res) { res.set_content(kWebUi, "text/html; charset=utf-8"); });
 
     srv.Get("/health", [&](const httplib::Request &, httplib::Response &res) {
         size_t used = 0, total = 0;
@@ -354,7 +364,7 @@ int main(int argc, char **argv) {
                         "application/json");
     });
 
-    std::fprintf(stderr, "[axdiffusion] listening on %s:%d (OpenAI /v1/images/generations, A1111 /sdapi/v1/txt2img)\n",
+    std::fprintf(stderr, "[axdiffusion] listening on %s:%d (web UI at /, OpenAI /v1/images/*, A1111 /sdapi/v1/*)\n",
                  host.c_str(), port);
     if (!srv.listen(host, port)) {
         std::fprintf(stderr, "error: cannot listen on %s:%d\n", host.c_str(), port);
