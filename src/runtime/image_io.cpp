@@ -1,5 +1,6 @@
 #include "image_io.hpp"
 
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -9,6 +10,8 @@
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 namespace axd {
 
@@ -95,6 +98,23 @@ Image load_image(const std::string &path) {
     std::stringstream ss;
     ss << f.rdbuf();
     return decode_image(ss.str());
+}
+
+bool write_png(const std::string &path, const std::vector<uint8_t> &rgb, int w, int h) {
+    stbi_write_png_compression_level = 1;
+    std::string tmp = path + ".tmp";
+    if (!stbi_write_png(tmp.c_str(), w, h, 3, rgb.data(), w * 3)) return false;
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+std::string encode_png(const std::vector<uint8_t> &rgb, int w, int h) {
+    stbi_write_png_compression_level = 1;
+    std::string out;
+    auto sink = [](void *ctx, void *data, int size) {
+        static_cast<std::string *>(ctx)->append(static_cast<const char *>(data), size_t(size));
+    };
+    if (!stbi_write_png_to_func(sink, &out, w, h, 3, rgb.data(), w * 3)) fail("PNG encoding failed");
+    return out;
 }
 
 }  // namespace axd

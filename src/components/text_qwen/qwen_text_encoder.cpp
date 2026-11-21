@@ -2,7 +2,8 @@
 #include <cmath>
 
 #include "common.hpp"
-#include "pipeline.hpp"
+#include "qwen_text_encoder.hpp"
+#include "safetensors.hpp"
 
 namespace axd {
 
@@ -22,8 +23,8 @@ TextEncoder::TextEncoder(const ModelDir &dir, const TextWeights &w) : w_(w) {
     positions_ = DeviceBuffer(3 * kMaxTextTokens * 4, "text-positions");
     cos_ = DeviceBuffer(kMaxTextTokens * 64 * 4, "text-cos");
     sin_ = DeviceBuffer(kMaxTextTokens * 64 * 4, "text-sin");
-    paged_ = DeviceBuffer(size_t(2) * kPage * kKvHeads * kHeadDim * 2, "text-paged-kv");
-    page_out_ = DeviceBuffer(size_t(2) * kPage * kKvHeads * kHeadDim * 2, "text-page-out");
+    paged_ = DeviceBuffer(size_t(2) * kPage * kKvHeads * kTextHeadDim * 2, "text-paged-kv");
+    page_out_ = DeviceBuffer(size_t(2) * kPage * kKvHeads * kTextHeadDim * 2, "text-page-out");
     indptr_ = DeviceBuffer(2 * 4, "text-indptr");
     indices_ = DeviceBuffer(4, "text-indices");
     cache_loc_ = DeviceBuffer(2 * 4, "text-cache-location");
@@ -35,7 +36,7 @@ TextEncoder::TextEncoder(const ModelDir &dir, const TextWeights &w) : w_(w) {
     std::vector<float> c(kMaxTextTokens * 64), s(kMaxTextTokens * 64);
     for (int p = 0; p < kMaxTextTokens; ++p)
         for (int i = 0; i < 64; ++i) {
-            float inv = 1.0f / float(std::pow(kRopeTheta, double(2 * i) / kHeadDim));
+            float inv = 1.0f / float(std::pow(kRopeTheta, double(2 * i) / kTextHeadDim));
             float a = float(p) * inv;
             c[p * 64 + i] = std::cos(a);
             s[p * 64 + i] = std::sin(a);
@@ -78,5 +79,48 @@ std::vector<uint16_t> TextEncoder::encode(const std::vector<int32_t> &ids) {
     x.download(hidden.data(), hidden.size() * 2);
     return hidden;
 }
+
+std::unique_ptr<TextWeights> load_text_weights(const ModelDir &dir) {
+    auto w = std::make_unique<TextWeights>();
+    {
+        SafeTensors st(dir.file("text_encoder/embed_bf16.safetensors"));
+        auto &t = st.get("weight");
+        w->embed = DeviceBuffer(t.nbytes, "text-embedding");
+        w->embed.buf().upload(t.data, t.nbytes);
+    }
+    // kernel input name -> tensor name in the layer file
+    static const std::pair<const char *, const char *> kMap[] = {
+        {"x_norm_w", "attention.w_norm_attn"}, {"w_q", "attention.w_q"},
+        {"w_scale_q", "attention.w_scale_q"}, {"w_scale2_q", "attention.w_scale2_q"},
+        {"w_zeropoint_q", "attention.w_zeropoint_q"}, {"w_k", "attention.w_k"},
+        {"w_scale_k", "attention.w_scale_k"}, {"w_scale2_k", "attention.w_scale2_k"},
+        {"w_zeropoint_k", "attention.w_zeropoint_k"}, {"w_v", "attention.w_v"},
+        {"w_scale_v", "attention.w_scale_v"}, {"w_scale2_v", "attention.w_scale2_v"},
+        {"w_zeropoint_v", "attention.w_zeropoint_v"}, {"q_norm_w", "attention.w_norm_q"},
+        {"k_norm_w", "attention.w_norm_k"}, {"w_o", "attention.w_o"},
+        {"w_scale_o", "attention.w_scale_o"}, {"w_scale2_o", "attention.w_scale2_o"},
+        {"w_zeropoint_o", "attention.w_zeropoint_o"}, {"w_norm", "mlp.w_norm"},
+        {"w1", "mlp.w1"}, {"w_scale1", "mlp.w_scale1"}, {"w_scale2_1", "mlp.w_scale2_1"},
+        {"w2", "mlp.w2"}, {"w_scale2", "mlp.w_scale2"}, {"w_scale2_2", "mlp.w_scale2_2"},
+        {"w3", "mlp.w3"}, {"w_scale3", "mlp.w_scale3"}, {"w_scale2_3", "mlp.w_scale2_3"},
+        {"w_zp_scale1", "mlp.w_zp_scale1"}, {"w_zp_scale2", "mlp.w_zp_scale2"},
+        {"w_zp_scale3", "mlp.w_zp_scale3"}, {"input_permutation", "mlp.input_permutation"},
+    };
+    for (int i = 0; i < kTextLayers; ++i) {
+        char rel[64];
+        std::snprintf(rel, sizeof(rel), "text_encoder/layers/layer_%03d.safetensors", i);
+        SafeTensors st(dir.file(rel));
+        auto bank = std::make_unique<TensorBank>("text-layer-" + std::to_string(i));
+        for (auto &kv : kMap) {
+            auto &t = st.get(kv.second);
+            bank->add(kv.first, t.data, t.nbytes);
+        }
+        bank->materialize();
+        w->layers.push_back(std::move(bank));
+        if (i % 10 == 9) AXD_LOG("text layers loaded: %d/50", i + 1);
+    }
+    return w;
+}
+
 
 }  // namespace axd

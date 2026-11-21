@@ -1,27 +1,27 @@
-// axdiffusion-cli: generate one image from a prompt.
-//   axdiffusion-cli --model <MiniMax-H3-Image-AX8860 dir> --prompt "..." [--size 1024|2048] [--seed 42]
-//             [--out out.png] [--repeat N] [--steps 6] [--blocks 50] [--dump-dir DIR] [--quiet]
+// axdiffusion-cli: run one request (or N repeats) from the command line.
+//   axdiffusion-cli --model DIR --prompt TEXT [--size 1024 | --width W --height H] [--seed N] [--out out.png]
+//                   [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]... [--repeat N] [--steps N]
+//                   [--blocks N] [--dump-dir DIR] [--quiet]
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 
 #include "common.hpp"
 #include "json.hpp"
-#include "pipeline.hpp"
+#include "model.hpp"
 
 static void usage() {
     std::fprintf(stderr,
-                 "usage: axdiffusion-cli --model DIR --prompt TEXT [--size 1024|2048] [--seed N] [--out PNG]\n"
-                 "                 [--repeat N] [--steps 1..6] [--blocks 1..50] [--dump-dir DIR] [--quiet]\n"
-                 "                 [--lora-dir DIR] [--lora NAME[:SCALE]]... [--image REF.png]...\n");
+                 "usage: axdiffusion-cli --model DIR --prompt TEXT [--size 1024|2048] [--width W --height H]\n"
+                 "                       [--seed N] [--out PNG] [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]...\n"
+                 "                       [--repeat N] [--steps N] [--blocks N] [--dump-dir DIR] [--quiet]\n");
 }
 
 int main(int argc, char **argv) {
-    std::string model;
-    axd::GenerateRequest req;
-    req.out_png = "out.png";
+    std::string model_dir, out = "out.png";
+    axd::Request req;
+    axd::ModelOptions opt;
     int repeat = 1;
-    std::string lora_dir;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -31,18 +31,20 @@ int main(int argc, char **argv) {
             }
             return argv[++i];
         };
-        if (a == "--model") model = next();
+        if (a == "--model") model_dir = next();
         else if (a == "--prompt") req.prompt = next();
-        else if (a == "--size") req.size = std::stoi(next());
+        else if (a == "--size") req.width = req.height = std::stoi(next());
+        else if (a == "--width") req.width = std::stoi(next());
+        else if (a == "--height") req.height = std::stoi(next());
         else if (a == "--seed") req.seed = std::stoull(next());
-        else if (a == "--out") req.out_png = next();
+        else if (a == "--out") out = next();
         else if (a == "--repeat") repeat = std::stoi(next());
         else if (a == "--steps") req.steps = std::stoi(next());
         else if (a == "--blocks") req.blocks = std::stoi(next());
         else if (a == "--dump-dir") req.dump_dir = next();
         else if (a == "--quiet") axd::g_verbose = false;
-        else if (a == "--lora-dir") lora_dir = next();
-        else if (a == "--image") req.references.push_back(axd::load_image(next()));
+        else if (a == "--lora-dir") opt.lora_dir = next();
+        else if (a == "--image") req.images.push_back(axd::load_image(next()));
         else if (a == "--lora") {
             std::string v = next();
             auto c = v.rfind(':');
@@ -54,42 +56,42 @@ int main(int argc, char **argv) {
                 s.name = v;
             }
             req.loras.push_back(s);
-        }
-        else {
+        } else {
             usage();
             return 2;
         }
     }
-    if (model.empty() || req.prompt.empty()) {
+    if (model_dir.empty() || req.prompt.empty()) {
         usage();
         return 2;
     }
+    if (!req.images.empty()) req.task = axd::Task::edit;
+    if (!req.loras.empty() && opt.lora_dir.empty()) opt.lora_dir = ".";
     try {
-        if (!req.loras.empty() && lora_dir.empty()) lora_dir = ".";
-        axd::Pipeline pipe(model, lora_dir);
+        auto model = axd::create_model(model_dir, opt);
+        model->runtime().bind_thread();
+        axd::Progress progress;
+        progress.report = [](const std::string &stage, int step, int total) {
+            if (axd::g_verbose && total) std::fprintf(stderr, "[axdiffusion] %s %d/%d\n", stage.c_str(), step, total);
+        };
         for (int k = 0; k < repeat; ++k) {
-            auto r = pipe.generate(req);
+            auto r = model->run(req, progress);
+            std::string path = out;
+            if (repeat > 1) {
+                auto dot = out.rfind('.');
+                path = out.substr(0, dot) + "_" + std::to_string(k) + (dot == std::string::npos ? "" : out.substr(dot));
+            }
+            double t0 = axd::now_s();
+            if (!r.images.empty() && !axd::write_png(path, r.images[0].rgb, r.images[0].width, r.images[0].height))
+                throw std::runtime_error("cannot write " + path);
+            r.seconds["png"] = axd::now_s() - t0;
             size_t used = 0, total = 0;
-            pipe.cmm(used, total);
-            nlohmann::json j = {{"run", k},
-                                {"tokens", r.ids.size()},
-                                {"truncated", r.truncated},
-                                {"used", r.used},
-                                {"padded", r.padded},
-                                {"load_s", pipe.load_seconds()},
-                                {"lora_s", r.lora_s},
-                                {"tokenize_s", r.tokenize_s},
-                                {"text_s", r.text_s},
-                                {"dit_prepare_s", r.dit_prepare_s},
-                                {"dit_steps_s", r.dit_steps_s},
-                                {"step_s", r.step_seconds},
-                                {"block_mean_s", r.block_mean_s},
-                                {"vae_s", r.vae_s},
-                                {"png_s", r.png_s},
-                                {"total_s", r.total_s},
-                                {"cmm_used_gib", used / 1073741824.0},
-                                {"out", req.out_png}};
-            if (!req.dump_dir.empty()) j["ids"] = r.ids;
+            model->runtime().cmm(used, total);
+            nlohmann::json j = {{"run", k},          {"out", path},          {"seed", req.seed},
+                                {"tokens", r.token_ids.size()}, {"truncated", r.truncated},
+                                {"load_s", model->load_seconds()}, {"seconds", r.seconds},
+                                {"metrics", r.metrics}, {"cmm_used_gib", used / 1073741824.0}};
+            if (!req.dump_dir.empty()) j["ids"] = r.token_ids;
             std::printf("%s\n", j.dump().c_str());
             std::fflush(stdout);
         }

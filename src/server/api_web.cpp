@@ -1,0 +1,35 @@
+// Built-in web page and health check.
+#include "api.hpp"
+#include "web_ui.hpp"
+
+namespace axd {
+
+void register_web(httplib::Server &srv, ServerContext &ctx) {
+    for (const char *path : {"/", "/index.html"})
+        srv.Get(path, [](const httplib::Request &, httplib::Response &res) {
+            res.set_content(kWebUi, "text/html; charset=utf-8");
+        });
+    srv.Get("/health", [&](const httplib::Request &, httplib::Response &res) {
+        size_t used = 0, total = 0;
+        ctx.model.runtime().cmm(used, total);
+        auto info = ctx.model.info();
+        nlohmann::json tasks = nlohmann::json::array(), sizes = nlohmann::json::array();
+        for (auto t : info.tasks) tasks.push_back(task_name(t));
+        for (auto &s : info.sizes) sizes.push_back(std::to_string(s[0]) + "x" + std::to_string(s[1]));
+        res.set_content(nlohmann::json{{"status", "ok"},
+                                       {"model", ctx.model_name},
+                                       {"arch", info.arch},
+                                       {"tasks", tasks},
+                                       {"sizes", sizes},
+                                       {"lora", info.lora},
+                                       {"max_references", info.max_references},
+                                       {"load_s", ctx.model.load_seconds()},
+                                       {"requests", ctx.queue.served()},
+                                       {"queued", ctx.queue.pending()},
+                                       {"cmm_used_gib", used / 1073741824.0}}
+                            .dump(),
+                        "application/json");
+    });
+}
+
+}  // namespace axd

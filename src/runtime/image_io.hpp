@@ -17,4 +17,7 @@ struct Image {
 Image decode_image(const std::string &bytes);
 Image load_image(const std::string &path);
 
+bool write_png(const std::string &path, const std::vector<uint8_t> &rgb, int w, int h);
+std::string encode_png(const std::vector<uint8_t> &rgb, int w, int h);  // in-memory PNG bytes
+
 }  // namespace axd

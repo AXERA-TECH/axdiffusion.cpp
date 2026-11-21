@@ -52,7 +52,7 @@ section{padding:18px 20px;overflow:auto}
 <aside>
   <div><label for="prompt">提示词</label><textarea id="prompt" placeholder="A photograph of an orange tabby cat sitting on a wooden windowsill in soft afternoon light"></textarea></div>
   <div class="row">
-    <div><label for="size">尺寸</label><select id="size"><option value="1024x1024">1024 × 1024</option><option value="2048x2048">2048 × 2048</option></select></div>
+    <div><label for="size">尺寸</label><select id="size"><option value="1024">1024 × 1024</option><option value="2048">2048 × 2048</option></select></div>
     <div><label for="n">张数</label><select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
   </div>
   <div><label for="seed">种子</label><input id="seed" type="number" min="0" value="42"><div class="check"><input type="checkbox" id="rand"><span>每次随机</span></div></div>
@@ -74,7 +74,7 @@ async function health(){
   try{
     const h = await (await fetch('/health')).json();
     $('#model').textContent = h.model || '';
-    $('#status').textContent = `就绪 · 已出图 ${h.requests} 张 · NPU 内存 ${h.cmm_used_gib.toFixed(1)} GiB`;
+    $('#status').textContent = `就绪 · 已出图 ${h.requests} 张 · 排队 ${h.queued} · NPU 内存 ${h.cmm_used_gib.toFixed(1)} GiB`;
   }catch(e){ $('#status').textContent = '服务不可用'; }
 }
 async function loadLoras(){
@@ -116,35 +116,43 @@ function addCard(b64, prompt, info, loras){
   c.append(img, m); $('#grid').prepend(c);
 }
 $('#viewer').onclick = () => $('#viewer').style.display='none';
+const toB64 = f => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(f); });
+const stageName = {lora:'构建 LoRA', text_encoder:'文本编码', denoise:'去噪', vae:'VAE 解码'};
+let current = null;
+async function runOne(body){
+  const sub = await fetch('/v1/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const job = await sub.json();
+  if(!sub.ok || job.error && !job.id) throw new Error(job.error ? job.error.message : sub.statusText);
+  current = job.id;
+  for(;;){
+    await new Promise(r=>setTimeout(r, 400));
+    const j = await (await fetch('/v1/jobs/' + job.id)).json();
+    if(j.status === 'succeeded') return j;
+    if(j.status === 'failed' || j.status === 'cancelled') throw new Error(j.error || j.status);
+    const st = j.status === 'queued' ? '排队中' : (stageName[j.stage] || j.stage || '准备中');
+    const pr = j.progress && j.progress.total ? ` ${j.progress.step}/${j.progress.total}` : '';
+    $('#state').textContent = `${st}${pr}`;
+  }
+}
 $('#go').onclick = async () => {
   const prompt = $('#prompt').value.trim();
   if(!prompt){ $('#state').innerHTML='<span class="err">请先输入提示词</span>'; return; }
-  const loras = selectedLoras(), n = parseInt($('#n').value), size = $('#size').value;
-  const seed = $('#rand').checked ? Math.floor(Math.random()*4294967295) : parseInt($('#seed').value||'0');
+  const loras = selectedLoras(), n = parseInt($('#n').value), size = parseInt($('#size').value);
   const files = [...$('#refs').files];
   $('#go').disabled = true;
   const t0 = performance.now();
-  const tick = setInterval(()=>{ $('#state').textContent = `生成中… ${((performance.now()-t0)/1000).toFixed(0)} 秒`; }, 250);
   try{
-    let resp;
-    if(files.length){
-      const fd = new FormData();
-      files.forEach(f=>fd.append('image[]', f));
-      fd.append('prompt', prompt); fd.append('n', String(n)); fd.append('size', size); fd.append('seed', String(seed));
-      fd.append('loras', JSON.stringify(loras));
-      resp = await fetch('/v1/images/edits', {method:'POST', body:fd});
-    }else{
-      resp = await fetch('/v1/images/generations', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({prompt, n, size, seed, loras, response_format:'b64_json'})});
+    const images = await Promise.all(files.map(toB64));
+    for(let i = 0; i < n; i++){
+      const seed = $('#rand').checked ? Math.floor(Math.random()*4294967295) : parseInt($('#seed').value||'0') + i;
+      const j = await runOne({task: images.length ? 'edit' : 'txt2img', prompt, width:size, height:size, seed, loras, images});
+      j.images.forEach(b64=>addCard(b64, prompt, Object.assign({}, j.info, {seconds: j.info.seconds}), loras));
     }
-    const d = await resp.json();
-    if(!resp.ok || d.error) throw new Error(d.error ? d.error.message : resp.statusText);
-    d.data.forEach((x,i)=>addCard(x.b64_json, prompt, d.info ? d.info[i] : null, loras));
     $('#state').textContent = `完成，用时 ${((performance.now()-t0)/1000).toFixed(1)} 秒`;
   }catch(e){
     $('#state').innerHTML = '<span class="err"></span>'; $('#state .err').textContent = '出错：' + e.message;
   }finally{
-    clearInterval(tick); $('#go').disabled = false; health();
+    current = null; $('#go').disabled = false; health();
   }
 };
 document.addEventListener('keydown', e=>{ if((e.ctrlKey||e.metaKey) && e.key==='Enter') $('#go').click(); });

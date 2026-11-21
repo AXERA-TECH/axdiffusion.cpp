@@ -17,15 +17,11 @@
 #include <vector>
 
 #include "npu.hpp"
+#include "task.hpp"
 
 namespace axd {
 
 constexpr int kLoraRank = 64;
-
-struct LoraSpec {
-    std::string name;  // file stem inside the LoRA directory, or a path to a .safetensors file
-    float scale = 1.0f;
-};
 
 // One resident LoRA combination.
 struct LoraSet {

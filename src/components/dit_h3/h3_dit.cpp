@@ -2,20 +2,19 @@
 #include <cmath>
 
 #include "common.hpp"
-#include "pipeline.hpp"
+#include "h3_dit.hpp"
+#include "lora.hpp"
+#include "safetensors.hpp"
 
 namespace axd {
+
+const float kSigmas[kSteps + 1] = {1.0f, 0.9675f, 0.8875f, 0.75f, 0.5328f, 0.2320f, 0.0f};
 
 namespace {
 
 constexpr int kWorkspaceHeads = 14;  // 56 heads / 4 cores
 constexpr int kAdalnRows = 3;
 
-int padded_length(int used) { return std::max((used + 63) / 64 * 64, (used + 255) / 256 * 256); }
-int runtime_padded_length(int used) {
-    int base = padded_length(used);
-    return (base + 511) / 512 * 512;
-}
 
 // out[rows, N] (bf16) = x[rows, K] @ W[N, K]^T + b, FP32 accumulation, threaded over N.
 void host_linear(const float *x, int rows, int K, const std::vector<float> &W, const std::vector<float> &b, int N,
@@ -57,21 +56,23 @@ struct RefinerWs {
 };
 
 Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
-    for (int p : {1280, 1536, 4608}) {
-        block_[p] = std::make_unique<Model>(dir.axmodel("dit-block", shape_key(p)));
-        final_[p] = std::make_unique<Model>(dir.axmodel("dit-final", shape_key(p)));
-        // optional block kernel with the LoRA low-rank branch
-        if (dir.has_axmodel("dit-block-lora", shape_key(p)))
-            lora_block_[p] = std::make_unique<Model>(dir.axmodel("dit-block-lora", shape_key(p)));
-    }
-    for (int r : {64, 512}) {
-        std::string key = r == 64 ? "64-row" : "512-row";
-        refiner_[r] = std::make_unique<Model>(dir.axmodel("dit-refiner", key));
-        rmsnorm_[r] = std::make_unique<Model>(dir.axmodel("dit-refiner-norm", key));
-    }
-    // Allocate every workspace up front so requests never touch the allocator.
-    for (int p : {1280, 1536, 4608}) shape(p);
-    for (int r : {64, 512}) refiner_ws(r);
+    // Sequence tiers come from the model directory's manifest ("... padded N ..."), so new tiers
+    // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
+    for (auto &kv : dir.tiers("dit-block", "padded ")) block_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-final", "padded ")) final_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-block-lora", "padded ")) lora_block_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-refiner", "")) refiner_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : block_)
+        if (!final_.count(kv.first)) fail("DiT tier " + std::to_string(kv.first) + " has a block but no final kernel");
+    if (block_.empty() || refiner_.empty()) fail("model directory has no DiT / refiner kernels");
+    // The 1280 tier is compiled without runtime sequence bounds (static 1024x1024 + 51-token prompt path).
+    if (block_.count(1280) && !block_[1280]->has_input("sequence_bounds")) fast_tier_ = 1280;
+    // Allocate the workspaces of the common tiers up front; larger tiers are allocated on first use.
+    for (auto &kv : block_)
+        if (kv.first <= 4608) shape(kv.first);
+    for (auto &kv : refiner_)
+        if (kv.first <= 512) refiner_ws(kv.first);
 }
 
 Dit::~Dit() = default;
@@ -137,22 +138,40 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
                   const LoraSet *lora) {
     image_tokens_ = (latent_h / 2) * (latent_w / 2);
     used_ = text_rows + image_tokens_;
-    const bool fast = latent_h == 64 && latent_w == 64 && text_rows == 51;
-    padded_ = fast ? 1280 : runtime_padded_length(used_);
-    if (!fast && !(padded_ - 512 < used_ && used_ <= padded_)) fail("runtime sequence window violated");
-    if (!block_.count(padded_)) fail("no compiled DiT kernel for padded length " + std::to_string(padded_));
+    const bool fast = fast_tier_ && latent_h == 64 && latent_w == 64 && text_rows == 51;
+    padded_ = 0;
+    if (fast) {
+        padded_ = fast_tier_;
+    } else {
+        // smallest runtime tier that holds the sequence (the kernel requires padded - 512 < used <= padded)
+        for (auto &kv : block_)
+            if (kv.first != fast_tier_ && kv.first >= used_ && kv.first - 512 < used_) {
+                padded_ = kv.first;
+                break;
+            }
+    }
+    if (!padded_) {
+        std::string have;
+        for (auto &kv : block_) have += " " + std::to_string(kv.first);
+        fail("no DiT kernel tier for a " + std::to_string(used_) + "-token sequence (available:" + have +
+             "); the prompt is too long for this resolution");
+    }
     if (lora && !lora_block_.count(padded_))
         fail("LoRA is not available for this shape (no LoRA block kernel for padded length " + std::to_string(padded_) + ")");
     text_rows_ = text_rows;
 
     // 1) text projection 5120 -> 5376 on the host (any prompt length)
-    std::vector<float> xt(size_t(text_rows) * kTextDim);
+    std::vector<float> xt(size_t(text_rows) * kDitTextDim);
     for (size_t i = 0; i < xt.size(); ++i) xt[i] = bf16_to_f32(text_hidden[i]);
     std::vector<uint16_t> proj(size_t(text_rows) * kDitHidden);
-    host_linear(xt.data(), text_rows, kTextDim, w_.context_w, w_.context_b, kDitHidden, proj.data());
+    host_linear(xt.data(), text_rows, kDitTextDim, w_.context_w, w_.context_b, kDitHidden, proj.data());
 
     // 2) token refiner (2 layers) + RMSNorm on the NPU
-    const int rows = fast ? 64 : 512;
+    int rows = 0;
+    if (fast && refiner_.count(64)) rows = 64;  // static 64-row refiner pairs with the static fast tier
+    for (auto it = refiner_.begin(); !rows && it != refiner_.end(); ++it)
+        if (it->first >= text_rows && it->first != 64) rows = it->first;
+    if (!rows) fail("no token refiner tier for " + std::to_string(text_rows) + " text rows");
     auto &r = refiner_ws(rows);
     r.x[0].buf().fill_zero();
     r.x[0].buf().upload(proj.data(), proj.size() * 2);
@@ -312,7 +331,7 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
 }
 
 void Dit::run(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
-              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora) {
+              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora, Progress *progress) {
     if (steps < 1 || steps > kSteps) fail("steps must be 1..6");
     if (blocks < 1 || blocks > kDitLayers) fail("blocks must be 1..50");
     double t0 = now_s();
@@ -321,11 +340,99 @@ void Dit::run(const std::vector<uint16_t> &text_hidden, int text_rows, int laten
     t0 = now_s();
     for (int i = 0; i < steps; ++i) {
         double s0 = now_s();
+        if (progress && progress->cancel) throw Cancelled();
         step(sample, i, blocks, t, lora);
+        if (progress) (*progress)("denoise", i + 1, steps);
         t.step_seconds.push_back(now_s() - s0);
         AXD_LOG("step %d/%d %.2f s", i + 1, steps, t.step_seconds.back());
     }
     t.steps = now_s() - t0;
+}
+
+Buf DitWeights::adaln_slot(int step, int layer, int slot) const {
+    const size_t slot_bytes = 3 * kDitHidden * 2;
+    size_t index = (size_t(step) * kDitLayers + layer) * 6 + slot;
+    return adaln_blocks.buf().view(index * slot_bytes, slot_bytes);
+}
+Buf DitWeights::adaln_input(int step) const {
+    return adaln->get("adaln_input").view(size_t(step) * 2688 * 2, 2688 * 2);
+}
+Buf DitWeights::final_shift(int step) const {
+    return adaln->get("final_shift").view(size_t(step) * kDitHidden * 2, kDitHidden * 2);
+}
+Buf DitWeights::final_scale(int step) const {
+    return adaln->get("final_scale").view(size_t(step) * kDitHidden * 2, kDitHidden * 2);
+}
+
+std::unique_ptr<DitWeights> load_dit_weights(const ModelDir &dir) {
+    auto w = std::make_unique<DitWeights>();
+    {
+        SafeTensors st(dir.file("dit/shared.safetensors"));
+        w->shared = std::make_unique<TensorBank>("dit-shared");
+        for (auto &name : st.names()) {
+            auto &t = st.get(name);
+            w->shared->add(name, t.data, t.nbytes);
+        }
+        w->shared->materialize();
+        w->proj_in_w = to_f32(st.get("proj_in.weight"));
+        w->proj_in_b = to_f32(st.get("proj_in.bias"));
+        w->context_w = to_f32(st.get("context.weight"));
+        w->context_b = to_f32(st.get("context.bias"));
+    }
+    {
+        SafeTensors st(dir.file("dit/adaln.safetensors"));
+        w->adaln = std::make_unique<TensorBank>("dit-adaln");
+        for (const char *name : {"adaln_input", "final_shift", "final_scale"}) {
+            auto &t = st.get(name);
+            w->adaln->add(name, t.data, t.nbytes);
+        }
+        w->adaln->materialize();
+        auto &blocks = st.get("blocks");  // [6,50,6,3,5376] bf16
+        if (blocks.nbytes != size_t(kSteps) * kDitLayers * 6 * 3 * kDitHidden * 2) fail("unexpected adaln table size");
+        w->adaln_blocks = DeviceBuffer(blocks.nbytes, "dit-adaln-blocks");
+        w->adaln_blocks.buf().upload(blocks.data, blocks.nbytes);
+    }
+    for (int i = 0; i < kDitLayers; ++i) {
+        char rel[64];
+        std::snprintf(rel, sizeof(rel), "dit/blocks/block%02d.safetensors", i);
+        SafeTensors st(dir.file(rel));
+        auto bank = std::make_unique<TensorBank>("dit-block-" + std::to_string(i));
+        for (auto &name : st.names()) {
+            auto &t = st.get(name);
+            bank->add(name, t.data, t.nbytes);
+        }
+        bank->materialize();
+        w->blocks.push_back(std::move(bank));
+        if (i % 10 == 9) AXD_LOG("DiT blocks loaded: %d/50", i + 1);
+    }
+    return w;
+}
+
+
+// [24,H,W] -> rows [(H/2)*(W/2), 96]; column = c*4 + ph*2 + pw
+std::vector<float> patchify(const std::vector<float> &noise, int h, int w) {
+    std::vector<float> rows(noise.size());
+    const int h2 = h / 2, w2 = w / 2;
+    for (int c = 0; c < kLatentChannels; ++c)
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                size_t r = size_t(y / 2) * w2 + x / 2;
+                rows[r * kPatchDim + c * 4 + (y % 2) * 2 + (x % 2)] = noise[(size_t(c) * h + y) * w + x];
+            }
+    (void)h2;
+    return rows;
+}
+
+std::vector<float> unpatchify(const std::vector<float> &rows, int h, int w) {
+    std::vector<float> out(rows.size());
+    const int w2 = w / 2;
+    for (int c = 0; c < kLatentChannels; ++c)
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                size_t r = size_t(y / 2) * w2 + x / 2;
+                out[(size_t(c) * h + y) * w + x] = rows[r * kPatchDim + c * 4 + (y % 2) * 2 + (x % 2)];
+            }
+    return out;
 }
 
 }  // namespace axd

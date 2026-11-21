@@ -61,4 +61,43 @@ std::vector<std::string> SafeTensors::names() const {
     return out;
 }
 
+std::vector<float> to_f32(const TensorView &t) {
+    std::vector<float> out(size_t(t.numel()));
+    if (t.dtype == "F32") {
+        std::memcpy(out.data(), t.data, out.size() * 4);
+    } else if (t.dtype == "BF16") {
+        auto *p = reinterpret_cast<const uint16_t *>(t.data);
+        for (size_t i = 0; i < out.size(); ++i) out[i] = bf16_to_f32(p[i]);
+    } else if (t.dtype == "F16") {
+        auto *p = reinterpret_cast<const uint16_t *>(t.data);
+        for (size_t i = 0; i < out.size(); ++i) {
+            uint16_t h = p[i];
+            uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1F, man = h & 0x3FF, bits;
+            if (exp == 0) {
+                if (man == 0) {
+                    bits = sign;
+                } else {  // subnormal
+                    exp = 127 - 15 + 1;
+                    while (!(man & 0x400)) man <<= 1, --exp;
+                    bits = sign | (exp << 23) | ((man & 0x3FF) << 13);
+                }
+            } else if (exp == 31) {
+                bits = sign | 0x7F800000u | (man << 13);
+            } else {
+                bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
+            }
+            std::memcpy(&out[i], &bits, 4);
+        }
+    } else {
+        fail("LoRA tensor has unsupported dtype " + t.dtype);
+    }
+    return out;
+}
+
+std::vector<uint16_t> to_bf16(const std::vector<float> &v) {
+    std::vector<uint16_t> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = f32_to_bf16(v[i]);
+    return out;
+}
+
 }  // namespace axd

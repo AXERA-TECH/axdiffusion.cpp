@@ -41,4 +41,8 @@ private:
     std::map<std::string, TensorView> tensors_;
 };
 
+// Convert a float tensor (F32 / BF16 / F16) to float32.
+std::vector<float> to_f32(const TensorView &t);
+std::vector<uint16_t> to_bf16(const std::vector<float> &v);
+
 }  // namespace axd

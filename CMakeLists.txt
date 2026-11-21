@@ -11,23 +11,19 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fopenmp-simd")
 # AXCL runtime shipped with the board SDK. Override with -DAXCL_ROOT=/path/to/axcl
 set(AXCL_ROOT "/usr/local/axhelix" CACHE PATH "AXCL SDK root (contains include/ and lib/)")
 
-add_library(axdcore STATIC
-  src/runtime/common.cpp
-  src/runtime/npu.cpp
-  src/runtime/safetensors.cpp
-  src/runtime/image_io.cpp
-  src/tokenizer/tokenizer.cpp
-  src/models/minimax_h3_image/weights.cpp
-  src/models/minimax_h3_image/text_encoder.cpp
-  src/models/minimax_h3_image/dit.cpp
-  src/models/minimax_h3_image/vae.cpp
-  src/models/minimax_h3_image/lora.cpp
-  src/models/minimax_h3_image/edit_host.cpp
-  src/models/minimax_h3_image/pipeline.cpp
-  third_party/unicode.cpp
-  third_party/unicode-data.cpp)
+file(GLOB AXD_SOURCES CONFIGURE_DEPENDS
+  src/runtime/*.cpp
+  src/components/*/*.cpp
+  src/models/*.cpp
+  src/models/*/*.cpp
+  src/server/*.cpp)
+add_library(axdcore STATIC ${AXD_SOURCES} third_party/unicode.cpp third_party/unicode-data.cpp)
 target_include_directories(axdcore PUBLIC
-  src/runtime src/tokenizer src/models/minimax_h3_image third_party ${AXCL_ROOT}/include)
+  src/runtime
+  src/components/tokenizer src/components/text_qwen src/components/dit_h3 src/components/lora src/components/vae_image
+  src/models src/models/minimax_h3_image
+  src/server
+  third_party ${AXCL_ROOT}/include)
 target_link_directories(axdcore PUBLIC ${AXCL_ROOT}/lib)
 target_link_libraries(axdcore PUBLIC axcl_rt pthread)
 
