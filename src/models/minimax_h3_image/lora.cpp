@@ -94,6 +94,26 @@ std::string normalize(std::string k) {
     return k;
 }
 
+// kohya flat names ("lora_unet_blocks_3_attn_qkv_proj", "lora_transformer_transformer_blocks_3_attn_to_q")
+// -> dotted module paths understood by map_module().
+std::string kohya_to_dotted(const std::string &m) {
+    static const std::regex re(
+        R"(^lora_(?:unet|transformer)_(token_refiner_refiner_blocks|token_refiner_blocks|transformer_blocks|blocks)_(\d+)_(.+)$)");
+    std::smatch s;
+    if (!std::regex_match(m, s, re)) return m;
+    std::string kind = s[1].str(), op = s[3].str();
+    if (kind == "token_refiner_refiner_blocks") kind = "token_refiner.refiner_blocks";
+    else if (kind == "token_refiner_blocks") kind = "token_refiner.blocks";
+    static const std::pair<const char *, const char *> ops[] = {
+        {"attn_qkv_proj", "attn.qkv_proj"}, {"attn_out_proj", "attn.out_proj"}, {"mlp_fc1", "mlp.fc1"},
+        {"mlp_fc2", "mlp.fc2"},           {"attn_to_q", "attn.to_q"},         {"attn_to_k", "attn.to_k"},
+        {"attn_to_v", "attn.to_v"},       {"attn_to_out_0", "attn.to_out.0"}, {"ff_net_0_proj", "ff.net.0.proj"},
+        {"ff_net_2", "ff.net.2"}};
+    for (auto &o : ops)
+        if (op == o.first) return kind + "." + s[2].str() + "." + o.second;
+    return m;
+}
+
 // module path -> target; returns false for unknown modules.
 bool map_module(const std::string &m, Target &t, int &row_offset, int &rows, bool &swap) {
     static const std::regex re_diff(
@@ -128,6 +148,137 @@ bool map_module(const std::string &m, Target &t, int &row_offset, int &rows, boo
         t.proj = FC2, rows = kOut[FC2];
     }
     return true;
+}
+
+// Upper Cholesky factor R of a symmetric positive (semi)definite n x n matrix G (G = R^T R); a tiny ridge keeps
+// rank-deficient inputs (e.g. a LoRA that only adapts q of a fused qkv) well defined.
+std::vector<double> cholesky_upper(std::vector<double> G, int n) {
+    double tr = 0;
+    for (int i = 0; i < n; ++i) tr += G[size_t(i) * n + i];
+    for (int i = 0; i < n; ++i) G[size_t(i) * n + i] += 1e-12 * (tr > 0 ? tr / n : 1.0);
+    std::vector<double> R(size_t(n) * n, 0.0);
+    for (int j = 0; j < n; ++j) {
+        double d = G[size_t(j) * n + j];
+        for (int k = 0; k < j; ++k) d -= R[size_t(k) * n + j] * R[size_t(k) * n + j];
+        double rjj = std::sqrt(std::max(d, 1e-300));
+        R[size_t(j) * n + j] = rjj;
+        for (int i = j + 1; i < n; ++i) {
+            double v = G[size_t(j) * n + i];
+            for (int k = 0; k < j; ++k) v -= R[size_t(k) * n + j] * R[size_t(k) * n + i];
+            R[size_t(j) * n + i] = v / rjj;
+        }
+    }
+    return R;
+}
+
+// X = R^{-1} Y for upper-triangular R [n,n], Y [n,m] (in place).
+void solve_upper(const std::vector<double> &R, int n, std::vector<double> &Y, int m) {
+    for (int c = 0; c < m; ++c)
+        for (int i = n - 1; i >= 0; --i) {
+            double v = Y[size_t(i) * m + c];
+            for (int k = i + 1; k < n; ++k) v -= R[size_t(i) * n + k] * Y[size_t(k) * m + c];
+            Y[size_t(i) * m + c] = v / R[size_t(i) * n + i];
+        }
+}
+
+// Replace B [out,n] * A [n,in] by its best rank-k approximation, in place: on return B is [out,k] and A is [k,in].
+// Uses only n x n Gram matrices plus row-streaming passes over B and A:
+//   B = Qb Rb, A^T = Qa Ra (Rb, Ra from Cholesky of B^T B and A A^T),  C = Rb Ra^T = U S V^T (one-sided Jacobi),
+//   B' = B Rb^{-1} U_k S_k,  A' = V_k^T Ra^{-T} A.
+// Returns the fraction of the squared Frobenius norm of B*A that is kept.
+double truncate_rank(std::vector<float> &B, std::vector<float> &A, int out, int in, int n, int k) {
+    std::vector<double> GB(size_t(n) * n, 0.0), GA(size_t(n) * n, 0.0);
+    for (int o = 0; o < out; ++o) {
+        const float *b = &B[size_t(o) * n];
+        for (int i = 0; i < n; ++i) {
+            if (b[i] == 0.f) continue;
+            double bi = b[i];
+            for (int j = i; j < n; ++j) GB[size_t(i) * n + j] += bi * b[j];
+        }
+    }
+    for (int i = 0; i < n; ++i)
+        for (int j = i; j < n; ++j) {
+            const float *ai = &A[size_t(i) * in], *aj = &A[size_t(j) * in];
+            double d = 0;
+            for (int c = 0; c < in; ++c) d += double(ai[c]) * aj[c];
+            GA[size_t(i) * n + j] = d;
+        }
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < i; ++j) GB[size_t(i) * n + j] = GB[size_t(j) * n + i], GA[size_t(i) * n + j] = GA[size_t(j) * n + i];
+    auto Rb = cholesky_upper(GB, n), Ra = cholesky_upper(GA, n);
+    std::vector<double> C(size_t(n) * n, 0.0), V(size_t(n) * n, 0.0);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
+            double d = 0;
+            for (int t = 0; t < n; ++t) d += Rb[size_t(i) * n + t] * Ra[size_t(j) * n + t];
+            C[size_t(i) * n + j] = d;
+        }
+    for (int i = 0; i < n; ++i) V[size_t(i) * n + i] = 1.0;
+    for (int sweep = 0; sweep < 60; ++sweep) {
+        double off = 0;
+        for (int p = 0; p < n - 1; ++p)
+            for (int q = p + 1; q < n; ++q) {
+                double a = 0, b = 0, g = 0;
+                for (int i = 0; i < n; ++i) {
+                    double cp = C[size_t(i) * n + p], cq = C[size_t(i) * n + q];
+                    a += cp * cp, b += cq * cq, g += cp * cq;
+                }
+                if (g == 0.0 || std::fabs(g) <= 1e-15 * std::sqrt(a * b)) continue;
+                off = std::max(off, std::fabs(g) / std::sqrt(a * b));
+                double zeta = (b - a) / (2 * g);
+                double t = (zeta >= 0 ? 1.0 : -1.0) / (std::fabs(zeta) + std::sqrt(1 + zeta * zeta));
+                double c = 1 / std::sqrt(1 + t * t), s = c * t;
+                for (int i = 0; i < n; ++i) {
+                    double cp = C[size_t(i) * n + p], cq = C[size_t(i) * n + q];
+                    C[size_t(i) * n + p] = c * cp - s * cq;
+                    C[size_t(i) * n + q] = s * cp + c * cq;
+                    double vp = V[size_t(i) * n + p], vq = V[size_t(i) * n + q];
+                    V[size_t(i) * n + p] = c * vp - s * vq;
+                    V[size_t(i) * n + q] = s * vp + c * vq;
+                }
+            }
+        if (off < 1e-12) break;
+    }
+    std::vector<double> sig(n);
+    std::vector<int> order(n);
+    double total = 0, kept = 0;
+    for (int j = 0; j < n; ++j) {
+        double s2 = 0;
+        for (int i = 0; i < n; ++i) s2 += C[size_t(i) * n + j] * C[size_t(i) * n + j];
+        sig[j] = s2, total += s2, order[j] = j;
+    }
+    std::sort(order.begin(), order.end(), [&](int x, int y) { return sig[x] > sig[y]; });
+    for (int j = 0; j < k; ++j) kept += sig[order[j]];
+    // TB = Rb^{-1} (U_k S_k) = Rb^{-1} C[:, top-k]   [n,k];   TA = Ra^{-1} V[:, top-k]   [n,k]
+    std::vector<double> TB(size_t(n) * k), TA(size_t(n) * k);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < k; ++j) TB[size_t(i) * k + j] = C[size_t(i) * n + order[j]], TA[size_t(i) * k + j] = V[size_t(i) * n + order[j]];
+    solve_upper(Rb, n, TB, k);
+    solve_upper(Ra, n, TA, k);
+    std::vector<float> Bn(size_t(out) * k), An(size_t(k) * in, 0.f);
+    for (int o = 0; o < out; ++o) {
+        const float *b = &B[size_t(o) * n];
+        for (int j = 0; j < k; ++j) {
+            double d = 0;
+            for (int t = 0; t < n; ++t) d += b[t] * TB[size_t(t) * k + j];
+            Bn[size_t(o) * k + j] = float(d);
+        }
+    }
+    // A' [k,in] = TA^T A
+    std::vector<double> acc(in);
+    for (int j = 0; j < k; ++j) {
+        std::fill(acc.begin(), acc.end(), 0.0);
+        for (int t = 0; t < n; ++t) {
+            double w = TA[size_t(t) * k + j];
+            if (w == 0.0) continue;
+            const float *a = &A[size_t(t) * in];
+            for (int c = 0; c < in; ++c) acc[c] += w * a[c];
+        }
+        for (int c = 0; c < in; ++c) An[size_t(j) * in + c] = float(acc[c]);
+    }
+    B.swap(Bn);
+    A.swap(An);
+    return total > 0 ? kept / total : 1.0;
 }
 
 std::string fmt_scale(float s) {
@@ -238,7 +389,7 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
             Target t{};
             int off = 0, rows = 0;
             bool swap = false;
-            if (!map_module(kv.first, t, off, rows, swap)) {
+            if (!map_module(kohya_to_dotted(kv.first), t, off, rows, swap)) {
                 unknown.push_back(kv.first);
                 continue;
             }
@@ -271,29 +422,38 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
     set->block_ab.assign(kDitLayers, zero_ab_);
     set->block_active.assign(kDitLayers, false);
 
-    // Build padded bf16 A [64,in] and B [out,64] for one target.
+    // Build padded bf16 A [64,in] and B [out,64] for one target. If the combined rank exceeds the kernel's
+    // rank, B*A is replaced by its best rank-64 approximation (truncated SVD).
     auto pack = [&](const std::vector<Piece> &ps, Proj proj, std::vector<uint16_t> &A, std::vector<uint16_t> &B) {
         const int in = kIn[proj], out = kOut[proj];
         int total = 0;
         for (auto &p : ps) total += p.rank;
-        if (total > kLoraRank)
-            fail(std::string("combined LoRA rank ") + std::to_string(total) + " exceeds " + std::to_string(kLoraRank) +
-                 " on " + kProjName[proj]);
-        A.assign(size_t(kLoraRank) * in, 0);
-        B.assign(size_t(out) * kLoraRank, 0);
+        // dense combined factors: Bt [out,total] (scale, row offset and half swap applied), At [total,in]
+        std::vector<float> At(size_t(total) * in), Bt(size_t(out) * total, 0.f);
         int r0 = 0;
         for (auto &p : ps) {
-            for (int r = 0; r < p.rank; ++r)
-                for (int k = 0; k < in; ++k) A[size_t(r0 + r) * in + k] = f32_to_bf16(p.A[size_t(r) * in + k]);
+            std::copy(p.A.begin(), p.A.end(), At.begin() + long(r0) * in);
             const int rows = int(p.B.size() / p.rank), half = out / 2;
             for (int o = 0; o < rows; ++o) {
                 int dst = p.row_offset + o;
                 if (p.swap_halves) dst = dst < half ? dst + half : dst - half;
-                for (int r = 0; r < p.rank; ++r)
-                    B[size_t(dst) * kLoraRank + r0 + r] = f32_to_bf16(p.scale * p.B[size_t(o) * p.rank + r]);
+                for (int r = 0; r < p.rank; ++r) Bt[size_t(dst) * total + r0 + r] = p.scale * p.B[size_t(o) * p.rank + r];
             }
             r0 += p.rank;
         }
+        int rank = total;
+        if (total > kLoraRank) {
+            double kept = truncate_rank(Bt, At, out, in, total, kLoraRank);
+            AXD_LOG("LoRA rank %d > %d on %s: truncated SVD keeps %.2f%% of the update energy", total, kLoraRank,
+                    kProjName[proj], kept * 100.0);
+            rank = kLoraRank;
+        }
+        A.assign(size_t(kLoraRank) * in, 0);
+        B.assign(size_t(out) * kLoraRank, 0);
+        for (int r = 0; r < rank; ++r)
+            for (int k = 0; k < in; ++k) A[size_t(r) * in + k] = f32_to_bf16(At[size_t(r) * in + k]);
+        for (int o = 0; o < out; ++o)
+            for (int r = 0; r < rank; ++r) B[size_t(o) * kLoraRank + r] = f32_to_bf16(Bt[size_t(o) * rank + r]);
     };
 
     // ---- DiT blocks: one allocation for all active blocks
@@ -313,20 +473,30 @@ std::unique_ptr<LoraSet> LoraManager::build(const std::vector<LoraSpec> &specs, 
     if (!active.empty()) {
         set->blocks = DeviceBuffer(per_block * active.size(), "lora-blocks");
         set->bytes += set->blocks.size();
+        // pack all (block, projection) targets in parallel (SVD truncation can be heavy), then upload
+        std::vector<std::vector<uint16_t>> packed(active.size() * 8);
+        parallel_for(active.size() * 4, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t) {
+                int b = active[t / 4], p = int(t % 4);
+                auto it = pieces.find({false, b, Proj(p)});
+                pack(it != pieces.end() ? it->second : std::vector<Piece>{}, Proj(p), packed[t * 2], packed[t * 2 + 1]);
+            }
+        });
         for (size_t ai = 0; ai < active.size(); ++ai) {
             int b = active[ai];
             size_t off = per_block * ai;
             std::array<Buf, 8> ab;
             for (int p = 0; p < 4; ++p) {
-                std::vector<uint16_t> A, B;
-                auto it = pieces.find({false, b, Proj(p)});
-                pack(it != pieces.end() ? it->second : std::vector<Piece>{}, Proj(p), A, B);
+                auto &A = packed[(ai * 4 + p) * 2];
+                auto &B = packed[(ai * 4 + p) * 2 + 1];
                 ab[2 * p] = set->blocks.buf().view(off, sz[2 * p]);
                 off += (sz[2 * p] + 255) / 256 * 256;
                 ab[2 * p + 1] = set->blocks.buf().view(off, sz[2 * p + 1]);
                 off += (sz[2 * p + 1] + 255) / 256 * 256;
                 ab[2 * p].upload(A.data(), A.size() * 2);
                 ab[2 * p + 1].upload(B.data(), B.size() * 2);
+                std::vector<uint16_t>().swap(A);
+                std::vector<uint16_t>().swap(B);
             }
             set->block_ab[b] = ab;
             set->block_active[b] = true;
