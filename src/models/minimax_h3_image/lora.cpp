@@ -141,9 +141,12 @@ bool map_module(const std::string &m, Target &t, int &row_offset, int &rows, boo
         t.proj = QKV, rows = kOut[QKV];
     } else if (op == "attn.to_out.0" || op == "attn.out_proj") {
         t.proj = OUT, rows = kOut[OUT];
-    } else if (op == "ff.net.0.proj" || op == "mlp.fc1") {
-        // checkpoint order is [x | gate]; the kernel's fc1 rows are [silu-gate | up]
+    } else if (op == "ff.net.0.proj") {
+        // diffusers order is [x | gate]; the kernel's fc1 rows are [silu-gate | up]
         t.proj = FC1, rows = kOut[FC1], swap = true;
+    } else if (op == "mlp.fc1") {
+        // ComfyUI/original checkpoint order already matches the kernel
+        t.proj = FC1, rows = kOut[FC1], swap = false;
     } else {
         t.proj = FC2, rows = kOut[FC2];
     }

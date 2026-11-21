@@ -22,6 +22,7 @@ add_library(axdcore STATIC
   src/models/minimax_h3_image/dit.cpp
   src/models/minimax_h3_image/vae.cpp
   src/models/minimax_h3_image/lora.cpp
+  src/models/minimax_h3_image/edit_host.cpp
   src/models/minimax_h3_image/pipeline.cpp
   third_party/unicode.cpp
   third_party/unicode-data.cpp)
