@@ -13,6 +13,7 @@
 #include "model.hpp"
 #include "model_dir.hpp"
 #include "qwen_text_encoder.hpp"
+#include "qwen_vision.hpp"
 #include "random.hpp"
 #include "tokenizer.hpp"
 
@@ -55,6 +56,7 @@ public:
         text_ = std::make_unique<TextEncoder>(*dir_, *text_w_);
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
+        if (dir_->has_axmodel("vision-vit")) vit_ = std::make_unique<VisionEncoder>(*dir_);
         if (dir_->has_axmodel("image-vae-encode")) {
             vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
             std::ifstream cf(dir_->file("vae/config.json"));
@@ -76,6 +78,7 @@ public:
     ~H3ImageModel() override {
         // NPU objects go before the runtime.
         lora_.reset();
+        vit_.reset();
         vae_enc_.reset();
         vae_.reset();
         dit_.reset();
@@ -92,11 +95,28 @@ public:
         i.name = "minimax-h3-image";
         i.tasks = {Task::txt2img};
         if (edit_ready()) i.tasks.push_back(Task::edit);
-        i.sizes = {{1024, 1024}, {2048, 2048}};
+        for (int sz : supported_sizes()) i.sizes.push_back({sz, sz});
         i.max_prompt_tokens = std::min(text_->max_tokens(), dit_->max_text_rows(64 * 64 / 4));
         i.max_references = edit_ready() ? 3 : 0;
         i.lora = lora_ != nullptr;
         return i;
+    }
+
+    // Square sizes whose image rows fit at least one DiT tier (the manifest decides: 512/1024/2048/4096 ...).
+    std::vector<int> supported_sizes() const {
+        std::vector<int> out;
+        for (int sz : {512, 768, 1024, 1536, 2048, 3072, 4096}) {
+            const int lat = sz / 16;
+            if (dit_->max_text_rows(lat * lat / 4) > 0) out.push_back(sz);
+        }
+        return out;
+    }
+    void check_size(const Request &req) const {
+        auto sizes = supported_sizes();
+        if (req.width == req.height && std::find(sizes.begin(), sizes.end(), req.width) != sizes.end()) return;
+        std::string have;
+        for (int sz : sizes) have += " " + std::to_string(sz) + "x" + std::to_string(sz);
+        fail("unsupported size " + std::to_string(req.width) + "x" + std::to_string(req.height) + " (supported:" + have + ")");
     }
 
     std::vector<std::string> loras() const override { return lora_ ? lora_->available() : std::vector<std::string>{}; }
@@ -107,14 +127,13 @@ public:
     // features (the ViT kernel, or AXD_EDIT_VISION=<dir> with precomputed features for testing).
     bool edit_ready() const {
         return dit_->supports_edit() && text_->supports_vision() && vae_enc_ &&
-               (dir_->has_axmodel("vision-vit") || std::getenv("AXD_EDIT_VISION"));
+               (vit_ || std::getenv("AXD_EDIT_VISION"));
     }
 
     Result run(const Request &req, Progress &progress) override {
         if (req.task == Task::edit || !req.images.empty()) return run_edit(req, progress);
         if (req.task != Task::txt2img) fail(std::string("task ") + task_name(req.task) + " is not supported by this model");
-        if (req.width != req.height || (req.width != 1024 && req.width != 2048))
-            fail("supported sizes: 1024x1024, 2048x2048");
+        check_size(req);
         if (req.prompt.empty()) fail("prompt is empty");
         const int steps = req.steps ? req.steps : kSteps;
         const int blocks = req.blocks ? req.blocks : kDitLayers;
@@ -181,8 +200,7 @@ public:
         if (req.images.empty()) fail("edit needs at least one reference image");
         if (req.images.size() > 9) fail("at most 9 reference images");
         if (!req.loras.empty()) fail("LoRA is not supported together with reference editing yet");
-        if (req.width != req.height || (req.width != 1024 && req.width != 2048))
-            fail("supported sizes: 1024x1024, 2048x2048");
+        check_size(req);
         if (req.prompt.empty()) fail("prompt is empty");
         const int steps = req.steps ? req.steps : kSteps;
         const int blocks = req.blocks ? req.blocks : kDitLayers;
@@ -247,13 +265,23 @@ public:
         progress("vision");
         t0 = now_s();
         std::vector<std::array<int, 3>> grids(n_ref);
-        for (int k = 0; k < n_ref; ++k) edit::vit_pixel_values(vit_copies[k], grids[k]);
+        std::vector<std::vector<float>> pixel_values(n_ref);
+        for (int k = 0; k < n_ref; ++k) pixel_values[k] = edit::vit_pixel_values(vit_copies[k], grids[k]);
         std::vector<uint16_t> merger, ds[3];
-        if (const char *vd = std::getenv("AXD_EDIT_VISION")) {
+        if (const char *vd = std::getenv("AXD_EDIT_VISION")) {  // testing: precomputed features for these inputs
             merger = read_raw<uint16_t>(std::string(vd) + "/vision_merger.bf16");
             for (int i = 0; i < 3; ++i) ds[i] = read_raw<uint16_t>(std::string(vd) + "/vision_deepstack_" + std::to_string(i) + ".bf16");
         } else {
-            fail("the ViT kernel is not wired yet");
+            for (int k = 0; k < n_ref; ++k) {  // one image per launch chain; features concatenated in reference order
+                auto f = vit_->encode(pixel_values[k], grids[k][1], grids[k][2]);
+                merger.insert(merger.end(), f.merger.begin(), f.merger.end());
+                for (int i = 0; i < 3; ++i) ds[i].insert(ds[i].end(), f.deepstack[i].begin(), f.deepstack[i].end());
+                if (!req.dump_dir.empty()) {
+                    dump(req.dump_dir, "vision_merger_" + std::to_string(k) + ".bf16", f.merger);
+                    for (int i = 0; i < 3; ++i)
+                        dump(req.dump_dir, "vision_deepstack" + std::to_string(i) + "_" + std::to_string(k) + ".bf16", f.deepstack[i]);
+                }
+            }
         }
         r.seconds["vision"] = now_s() - t0;
 
@@ -318,6 +346,7 @@ private:
     std::unique_ptr<Dit> dit_;
     std::unique_ptr<Vae> vae_;
     std::unique_ptr<VaeEncoder> vae_enc_;
+    std::unique_ptr<VisionEncoder> vit_;
     std::vector<float> latents_mean_, latents_std_;
     std::unique_ptr<LoraManager> lora_;
     double load_s_ = 0;

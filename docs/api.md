@@ -9,10 +9,10 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `prompt` | string | 必填 | 提示词（最长 256 token） |
+| `prompt` | string | 必填 | 提示词（上限由模型目录的档位决定，当前 512 token；超出部分截断，`info.truncated` 为真） |
 | `model` | string | — | 可省略；`GET /v1/models` 返回的 id |
 | `n` | int | 1 | 1–4 |
-| `size` | string | `1024x1024` | `1024x1024` 或 `2048x2048` |
+| `size` | string | `1024x1024` | 正方形尺寸，可用值见 `GET /health` 的 `sizes`（由模型目录里的 DiT 档位决定） |
 | `response_format` | string | `b64_json` | `b64_json` 或 `url` |
 | `seed` | int | 随机 | 扩展字段；`n` > 1 时依次 +1 |
 | `steps` | int | 6 | 扩展字段，1–6 |
@@ -46,7 +46,7 @@
 | 字段 | 说明 |
 |---|---|
 | `prompt` | 提示词；可含 `<lora:NAME:SCALE>` |
-| `width`, `height` | 1024 或 2048（需相等） |
+| `width`, `height` | 需相等，可用值见 `GET /health` 的 `sizes` |
 | `seed` | `-1` 为随机 |
 | `batch_size`, `n_iter` | 乘积 ≤ 4 |
 | `steps`, `cfg_scale`, `sampler_name`, `negative_prompt` | 接受但忽略 |

@@ -20,7 +20,7 @@ file(GLOB AXD_SOURCES CONFIGURE_DEPENDS
 add_library(axdcore STATIC ${AXD_SOURCES} third_party/unicode.cpp third_party/unicode-data.cpp)
 target_include_directories(axdcore PUBLIC
   src/runtime
-  src/components/tokenizer src/components/text_qwen src/components/dit_h3 src/components/lora src/components/vae_image
+  src/components/tokenizer src/components/text_qwen src/components/dit_h3 src/components/lora src/components/vae_image src/components/vision_qwen
   src/models src/models/minimax_h3_image
   src/server
   third_party ${AXCL_ROOT}/include)

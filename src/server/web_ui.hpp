@@ -74,6 +74,13 @@ async function health(){
   try{
     const h = await (await fetch('/health')).json();
     $('#model').textContent = h.model || '';
+    const sel = $('#size'), want = (h.sizes || []).map(s => s.split('x')[0]);
+    if (want.length && want.join() !== [...sel.options].map(o => o.value).join()) {
+      const keep = sel.value;
+      sel.innerHTML = want.map(v => `<option value="${v}">${v} × ${v}</option>`).join('');
+      sel.value = want.includes(keep) ? keep : (want.includes('1024') ? '1024' : want[0]);
+    }
+    $('#refs').disabled = !(h.tasks || []).includes('edit');
     $('#status').textContent = `就绪 · 已出图 ${h.requests} 张 · 排队 ${h.queued} · NPU 内存 ${h.cmm_used_gib.toFixed(1)} GiB`;
   }catch(e){ $('#status').textContent = '服务不可用'; }
 }
