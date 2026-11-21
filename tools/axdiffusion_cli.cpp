@@ -13,7 +13,7 @@ static void usage() {
     std::fprintf(stderr,
                  "usage: axdiffusion-cli --model DIR --prompt TEXT [--size 1024|2048] [--seed N] [--out PNG]\n"
                  "                 [--repeat N] [--steps 1..6] [--blocks 1..50] [--dump-dir DIR] [--quiet]\n"
-                 "                 [--lora-dir DIR] [--lora NAME[:SCALE]]...\n");
+                 "                 [--lora-dir DIR] [--lora NAME[:SCALE]]... [--image REF.png]...\n");
 }
 
 int main(int argc, char **argv) {
@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
         else if (a == "--dump-dir") req.dump_dir = next();
         else if (a == "--quiet") axd::g_verbose = false;
         else if (a == "--lora-dir") lora_dir = next();
+        else if (a == "--image") req.references.push_back(axd::load_image(next()));
         else if (a == "--lora") {
             std::string v = next();
             auto c = v.rfind(':');

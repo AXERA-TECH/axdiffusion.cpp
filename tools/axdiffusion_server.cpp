@@ -3,8 +3,8 @@
 //   axdiffusion-server --model DIR [--host 0.0.0.0] [--port 18500] [--out-dir ./output] [--model-name minimax-h3-image]
 //
 // Standard APIs:
-//   OpenAI Images        POST /v1/images/generations   GET /v1/models
-//   A1111 / SD WebUI     POST /sdapi/v1/txt2img        GET /sdapi/v1/sd-models  GET /sdapi/v1/options
+//   OpenAI Images        POST /v1/images/generations   POST /v1/images/edits   GET /v1/models
+//   A1111 / SD WebUI     POST /sdapi/v1/txt2img   POST /sdapi/v1/img2img   GET /sdapi/v1/sd-models  GET /sdapi/v1/options
 // Others:
 //   GET /health                 readiness, CMM usage
 //   GET /files/<name>           images returned with response_format=url
@@ -43,6 +43,30 @@ std::string base64(const std::string &in) {
         out += t[v >> 18], out += t[(v >> 12) & 63];
         out += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
         out += '=';
+    }
+    return out;
+}
+
+std::string base64_decode(const std::string &in) {
+    static int T[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) T[i] = -1;
+        const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) T[uint8_t(a[i])] = i;
+        T[uint8_t('-')] = 62, T[uint8_t('_')] = 63;  // URL-safe alphabet
+        init = true;
+    }
+    std::string out;
+    int val = 0, bits = -8;
+    for (unsigned char c : in) {
+        if (T[c] < 0) continue;
+        val = (val << 6) + T[c];
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(char((val >> bits) & 0xFF));
+            bits -= 8;
+        }
     }
     return out;
 }
@@ -114,8 +138,10 @@ int main(int argc, char **argv) {
     std::atomic<int> served{0};
 
     // Runs one generation and returns PNG bytes; timing details go to `info`.
-    auto generate = [&](const std::string &prompt, int size, uint64_t seed, int steps, const json &loras, json &info) {
+    auto generate = [&](const std::string &prompt, int size, uint64_t seed, int steps, const json &loras, json &info,
+                        const std::vector<axd::Image> &refs = {}) {
         axd::GenerateRequest g;
+        g.references = refs;
         for (auto &l : loras) {
             axd::LoraSpec s;
             s.name = l.value("name", l.value("path", std::string()));
@@ -208,6 +234,43 @@ int main(int argc, char **argv) {
             error(res, 400, e.what());
         }
     });
+    // OpenAI image edits: multipart/form-data with image (or image[] repeated), prompt, n, size, response_format,
+    // plus extensions seed and loras (JSON string).
+    srv.Post("/v1/images/edits", [&](const httplib::Request &req, httplib::Response &res) {
+        try {
+            if (!req.is_multipart_form_data()) return error(res, 400, "expected multipart/form-data");
+            auto field = [&](const char *k, const std::string &def) {
+                return req.has_file(k) ? req.get_file_value(k).content : def;
+            };
+            std::vector<axd::Image> refs;
+            for (const char *k : {"image", "image[]"})
+                for (auto &f : req.get_file_values(k)) refs.push_back(axd::decode_image(f.content));
+            if (refs.empty()) return error(res, 400, "at least one image is required");
+            std::string prompt = field("prompt", "");
+            if (prompt.empty()) return error(res, 400, "prompt is required");
+            int n = std::stoi(field("n", "1"));
+            if (n < 1 || n > 4) return error(res, 400, "n must be 1..4");
+            int size = parse_size(field("size", "1024x1024"), 1024, 1024);
+            std::string fmt = field("response_format", "b64_json");
+            int64_t seed = std::stoll(field("seed", "-1"));
+            json loras = json::parse(field("loras", "[]"));
+            json data = json::array(), infos = json::array();
+            for (int i = 0; i < n; ++i) {
+                json info;
+                uint64_t s = seed >= 0 ? uint64_t(seed) + uint64_t(i) : pick_seed(-1);
+                std::string png = generate(prompt, size, s, axd::kSteps, loras, info, refs);
+                if (fmt == "url")
+                    data.push_back({{"url", "http://" + req.get_header_value("Host") + "/files/" + save(png)}});
+                else
+                    data.push_back({{"b64_json", base64(png)}});
+                infos.push_back(info);
+            }
+            res.set_content(json{{"created", std::time(nullptr)}, {"data", data}, {"info", infos}}.dump(),
+                            "application/json");
+        } catch (const std::exception &e) {
+            error(res, 400, e.what());
+        }
+    });
     srv.Get(R"(/files/([A-Za-z0-9_.-]+\.png))", [&](const httplib::Request &req, httplib::Response &res) {
         std::ifstream f(out_dir + "/" + req.matches[1].str(), std::ios::binary);
         if (!f) return error(res, 404, "not found");
@@ -238,6 +301,32 @@ int main(int argc, char **argv) {
             json info = {{"prompt", prompt}, {"seed", s0}, {"all_seeds", seeds}, {"width", size}, {"height", size},
                          {"steps", axd::kSteps}, {"sd_model_name", model_name}};
             res.set_content(json{{"images", images}, {"parameters", params}, {"info", info.dump()}}.dump(),
+                            "application/json");
+        } catch (const std::exception &e) {
+            error(res, 400, e.what());
+        }
+    });
+    // A1111 img2img: init_images are base64 (optionally data-URI) reference images; denoising_strength is
+    // ignored (the model edits from references with a fixed 6-step schedule).
+    srv.Post("/sdapi/v1/img2img", [&](const httplib::Request &req, httplib::Response &res) {
+        try {
+            auto b = json::parse(req.body);
+            std::vector<axd::Image> refs;
+            for (auto &s : b.value("init_images", json::array())) {
+                std::string v = s.get<std::string>();
+                auto comma = v.find(',');
+                if (v.rfind("data:", 0) == 0 && comma != std::string::npos) v = v.substr(comma + 1);
+                refs.push_back(axd::decode_image(base64_decode(v)));
+            }
+            if (refs.empty()) return error(res, 400, "init_images is required");
+            json loras = json::array();
+            std::string prompt = strip_lora_tags(b.value("prompt", std::string()), loras);
+            if (prompt.empty()) return error(res, 400, "prompt is required");
+            int size = parse_size("", b.value("width", 1024), b.value("height", 1024));
+            uint64_t s0 = pick_seed(b.value("seed", int64_t(-1)));
+            json info;
+            std::string png = generate(prompt, size, s0, axd::kSteps, loras, info, refs);
+            res.set_content(json{{"images", {base64(png)}}, {"parameters", b}, {"info", info.dump()}}.dump(),
                             "application/json");
         } catch (const std::exception &e) {
             error(res, 400, e.what());

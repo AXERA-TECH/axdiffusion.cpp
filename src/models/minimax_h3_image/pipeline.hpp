@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "image_io.hpp"
 #include "lora.hpp"
 #include "npu.hpp"
 #include "safetensors.hpp"
@@ -145,6 +146,7 @@ struct GenerateRequest {
     std::string out_png;     // optional
     std::string dump_dir;    // optional: write raw tensors for verification
     std::vector<LoraSpec> loras;  // optional dynamic LoRAs
+    std::vector<Image> references;  // optional reference images: switches to reference-image editing
 };
 
 struct GenerateResult {

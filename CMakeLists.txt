@@ -15,6 +15,7 @@ add_library(axdcore STATIC
   src/runtime/common.cpp
   src/runtime/npu.cpp
   src/runtime/safetensors.cpp
+  src/runtime/image_io.cpp
   src/tokenizer/tokenizer.cpp
   src/models/minimax_h3_image/weights.cpp
   src/models/minimax_h3_image/text_encoder.cpp

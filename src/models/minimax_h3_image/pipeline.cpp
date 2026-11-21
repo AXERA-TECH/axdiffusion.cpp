@@ -157,6 +157,8 @@ void dump(const std::string &dir, const std::string &name, const std::vector<T> 
 GenerateResult Pipeline::generate(const GenerateRequest &req) {
     if (req.size != 1024 && req.size != 2048) fail("size must be 1024 or 2048");
     if (req.prompt.empty()) fail("prompt is empty");
+    if (!req.references.empty())
+        fail("reference-image editing is not available with this model directory yet (edit kernels missing)");
     rt_->bind_thread();
     GenerateResult r;
     double t_all = now_s();
