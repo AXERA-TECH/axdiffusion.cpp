@@ -52,46 +52,54 @@ struct RefinerWs {
 Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
     // Sequence tiers come from the model directory's manifest ("... padded N ..."), so new tiers
     // (longer prompts, edit, other aspect ratios) only need new AXModels, not code.
-    auto load = [&](const std::string &purpose, std::map<int, std::unique_ptr<Model>> &into) {
+    // Only the paths are recorded here: a tier's kernel is loaded, and its workspaces allocated, on first use.
+    auto load = [&](const std::string &purpose, Tiers &into, bool need_granule) {
         auto shapes = dir.tier_shapes(purpose, "padded ");
         for (auto &kv : dir.tiers(purpose, "padded ")) {
-            into[kv.first] = std::make_unique<Model>(kv.second);
-            const Model *m = into[kv.first].get();
-            if (!m->has_input("sequence_bounds")) fail(purpose + " tier " + std::to_string(kv.first) + " has no runtime sequence bounds");
-            const int g = ModelDir::shape_int(shapes[kv.first], "granule ", 0);
-            if (g <= 0) fail(purpose + " tier " + std::to_string(kv.first) + ": manifest shape must state 'granule N'");
-            granule_[m] = g;
+            Kernel k;
+            k.path = kv.second;
+            k.what = purpose + " tier " + std::to_string(kv.first);
+            if (need_granule) {
+                k.granule = ModelDir::shape_int(shapes[kv.first], "granule ", 0);
+                if (k.granule <= 0) fail(k.what + ": manifest shape must state 'granule N'");
+            }
+            into[kv.first] = std::move(k);
         }
     };
-    load("dit-block", block_);
-    load("dit-block-edit", edit_block_);
-    for (auto &kv : dir.tiers("dit-final-edit", "padded ")) edit_final_[kv.first] = std::make_unique<Model>(kv.second);
-    for (auto &kv : dir.tiers("dit-final", "padded ")) final_[kv.first] = std::make_unique<Model>(kv.second);
+    load("dit-block", block_, true);
+    load("dit-block-edit", edit_block_, true);
+    load("dit-final-edit", edit_final_, false);
+    load("dit-final", final_, false);
     // LoRA block kernels per rank tier: "dit-block-lora" is rank 64, "dit-block-lora-rN" is rank N.
-    load("dit-block-lora", lora_block_[64]);
-    for (int r : {32, 96, 128, 192, 256}) load("dit-block-lora-r" + std::to_string(r), lora_block_[r]);
+    load("dit-block-lora", lora_block_[64], true);
+    for (int r : {32, 96, 128, 192, 256}) load("dit-block-lora-r" + std::to_string(r), lora_block_[r], true);
     for (auto it = lora_block_.begin(); it != lora_block_.end();)
         it = it->second.empty() ? lora_block_.erase(it) : std::next(it);
     for (auto &kv : dir.tiers("dit-refiner", "")) {
-        refiner_[kv.first] = std::make_unique<Model>(kv.second);
-        if (!refiner_[kv.first]->has_input("sequence_bounds"))
-            fail("dit-refiner " + std::to_string(kv.first) + "-row kernel has no runtime sequence bounds");
+        refiner_[kv.first].path = kv.second;
+        refiner_[kv.first].granule = 512;
+        refiner_[kv.first].what = "dit-refiner " + std::to_string(kv.first) + "-row";
     }
-    for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first] = std::make_unique<Model>(kv.second);
+    for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first].path = kv.second;
     for (auto &kv : block_)
         if (!final_.count(kv.first)) fail("DiT tier " + std::to_string(kv.first) + " has a block but no final kernel");
-    if (block_.empty() || refiner_.empty()) fail("model directory has no DiT / refiner kernels");
-    // Allocate the workspaces of the common tiers up front; larger tiers are allocated on first use.
-    for (auto &kv : block_)
-        if (kv.first <= 4608) shape(kv.first);
     for (auto &kv : refiner_)
-        if (kv.first <= 512) refiner_ws(kv.first);
+        if (!rmsnorm_.count(kv.first)) fail("refiner tier " + std::to_string(kv.first) + " has no RMSNorm kernel");
+    if (block_.empty() || refiner_.empty()) fail("model directory has no DiT / refiner kernels");
 }
 
 Dit::~Dit() = default;
 
+Model &Dit::Kernel::get() {
+    if (!model) {
+        model = std::make_unique<Model>(path);
+        if (granule && !model->has_input("sequence_bounds")) fail(what + " kernel has no runtime sequence bounds");
+    }
+    return *model;
+}
+
 int Dit::pick_tier(int used, int lora_rank, bool edit) const {
-    const std::map<int, std::unique_ptr<Model>> *cands = &block_;
+    const Tiers *cands = &block_;
     if (edit) {
         cands = &edit_block_;
     } else if (lora_rank) {
@@ -103,13 +111,13 @@ int Dit::pick_tier(int used, int lora_rank, bool edit) const {
     for (auto &kv : *cands) {
         const int P = kv.first;
         if (P < used || !finals.count(P)) continue;
-        if (P - granule_.at(kv.second.get()) < used) return P;
+        if (P - kv.second.granule < used) return P;
     }
     return 0;
 }
 
 int Dit::max_text_rows(int image_rows, int lora_rank) const {
-    const std::map<int, std::unique_ptr<Model>> *cands = &block_;
+    const Tiers *cands = &block_;
     if (lora_rank) {
         auto it = lora_block_.find(lora_rank);
         if (it == lora_block_.end()) return 0;
@@ -129,6 +137,8 @@ std::vector<int> Dit::lora_ranks() const {
 }
 
 DitShape &Dit::shape(int padded) {
+    // One tier's workspaces are kept (they are up to a few GiB); another tier replaces them.
+    for (auto it = shapes_.begin(); it != shapes_.end();) it = it->first == padded ? std::next(it) : shapes_.erase(it);
     auto &slot = shapes_[padded];
     if (slot) return *slot;
     auto s = std::make_unique<DitShape>();
@@ -163,6 +173,7 @@ DitShape &Dit::shape(int padded) {
 }
 
 RefinerWs &Dit::refiner_ws(int rows) {
+    for (auto it = refiners_.begin(); it != refiners_.end();) it = it->first == rows ? std::next(it) : refiners_.erase(it);
     auto &slot = refiners_[rows];
     if (slot) return *slot;
     auto r = std::make_unique<RefinerWs>();
@@ -253,13 +264,13 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
                        {"mlp_workspace", r.mlp},
                        {"q_workspace", r.q_ws}};
         in["sequence_bounds"] = r.bounds;
-        refiner_[rows]->run(in, {{"output", tgt},
+        refiner_.at(rows).get().run(in, {{"output", tgt},
                                  {"attention_output", r.attention_output},
                                  {"ffn_workspace", r.ffn},
                                  {"residual_workspace", r.residual}});
         std::swap(cur, tgt);
     }
-    rmsnorm_[rows]->run({{"x", cur}, {"weight", w_.shared->get("refiner.final_norm")}}, {{"output", r.normalized}});
+    rmsnorm_.at(rows).get().run({{"x", cur}, {"weight", w_.shared->get("refiner.final_norm")}}, {{"output", r.normalized}});
     refined_text_ = r.normalized.buf().view(0, size_t(text_rows) * kDitHidden * 2);
 
     // 3) per-request geometry: 3D RoPE table, combined indices, sequence bounds
@@ -369,9 +380,9 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
                        {"attention_workspace", s.attn_ws},
                        {"q_workspace", s.q_ws}};
         in["sequence_bounds"] = s.bounds;
-        Model *model = edit_ ? edit_block_.at(padded_).get() : block_[padded_].get();
+        Model *model = edit_ ? &edit_block_.at(padded_).get() : &block_.at(padded_).get();
         if (lora) {
-            model = lora_block_[lora->rank][padded_].get();
+            model = &lora_block_.at(lora->rank).at(padded_).get();
             const auto &ab = lora->block_ab[l];
             for (int k = 0; k < 8; ++k) in[kLoraInputs[k]] = ab[k];
         }
@@ -384,7 +395,7 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
         t.block_seconds.push_back(now_s() - t0);
     }
     auto final_run = [&](const Bindings &in, const Bindings &out) {
-        (edit_ ? edit_final_ : final_).at(padded_)->submit(*stream_, in, out);
+        (edit_ ? edit_final_ : final_).at(padded_).get().submit(*stream_, in, out);
         double t0 = now_s();
         stream_->sync();  // the velocity is read on the host next
         t.sync_seconds += now_s() - t0;

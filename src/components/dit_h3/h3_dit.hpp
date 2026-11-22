@@ -90,14 +90,20 @@ private:
     void step(std::vector<float> &sample, int step_index, int blocks, Timing &t, const LoraSet *lora);
 
     const DitWeights &w_;
-    std::map<int, std::unique_ptr<Model>> block_, final_, refiner_, rmsnorm_, edit_block_, edit_final_;
+    // A tier kernel: loaded on first use. Block/refiner kernels take runtime sequence bounds and accept used rows
+    // in (padded - granule, padded]; the granule is part of the manifest shape ("granule N").
+    struct Kernel {
+        std::string path, what;
+        int granule = 0;
+        std::unique_ptr<Model> model;
+        Model &get();
+    };
+    using Tiers = std::map<int, Kernel>;
+    Tiers block_, final_, refiner_, rmsnorm_, edit_block_, edit_final_;
     bool edit_ = false;                 // the prepared request is an edit
     int reference_rows_ = 0;
     std::vector<uint16_t> reference_proj_;  // [reference_rows,5376] bf16, projected once per request
-    std::map<int, std::map<int, std::unique_ptr<Model>>> lora_block_;  // [rank][padded]
-    // Every tier kernel takes runtime sequence bounds and accepts used rows in (padded - granule, padded]; the
-    // granule is part of the manifest shape ("granule N").
-    std::map<const Model *, int> granule_;
+    std::map<int, Tiers> lora_block_;  // [rank][padded]
     std::unique_ptr<Stream> stream_;  // block + final launches of a step are queued here
     std::map<int, std::unique_ptr<DitShape>> shapes_;
     std::map<int, std::unique_ptr<RefinerWs>> refiners_;
