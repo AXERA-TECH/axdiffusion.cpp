@@ -14,10 +14,9 @@ VisionEncoder::VisionEncoder(const ModelDir &dir) {
     auto shapes = dir.tier_shapes("vision-vit", "stage ");
     if (stages.empty()) fail("model directory has no vision-vit stages");
     int k = 0;
-    for (auto &kv : stages) {
+    for (auto &kv : stages)
         if (kv.first != k++) fail("vision-vit stages must be numbered 0..N-1");
-        stages_.push_back(std::make_unique<Model>(kv.second));
-    }
+    for (auto &kv : stages) stages_.push_back(std::make_unique<Model>(kv.second));
     grid_ = ModelDir::shape_int(shapes.begin()->second, "grid ", 0);
     if (grid_ <= 0 || grid_ % 2) fail("vision-vit shape must state an even 'grid N'");
     patches_ = grid_ * grid_;

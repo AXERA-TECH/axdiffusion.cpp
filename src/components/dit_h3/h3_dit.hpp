@@ -29,7 +29,6 @@ struct DitWeights {
     std::unique_ptr<TensorBank> shared, adaln;
     std::vector<std::unique_ptr<TensorBank>> blocks;
     std::vector<float> proj_in_w, proj_in_b;  // [5376,96], [5376] (host projection)
-    std::vector<float> context_w, context_b;  // [5376,5120], [5376]
     // adaln: blocks [6,50,6,3,5376], input [6,2688], final [6,5376] (bf16).
     // adaln_edit (reference editing, M=2: [t_i, 0.999] per step), optional: blocks [6,50,6,6,5376],
     // input [6,2,2688], final [6,2,5376].
@@ -100,6 +99,8 @@ private:
     };
     using Tiers = std::map<int, Kernel>;
     Tiers block_, final_, refiner_, rmsnorm_, edit_block_, edit_final_;
+    Kernel context_proj_;  // text projection, 256-row pages
+    DeviceBuffer ctx_in_, ctx_out_;
     bool edit_ = false;                 // the prepared request is an edit
     int reference_rows_ = 0;
     std::vector<uint16_t> reference_proj_;  // [reference_rows,5376] bf16, projected once per request

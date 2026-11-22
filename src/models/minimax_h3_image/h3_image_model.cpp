@@ -22,17 +22,6 @@ namespace axd {
 
 namespace {
 
-// Raw little-endian file -> vector (used for debug inputs such as precomputed vision features).
-template <typename T>
-std::vector<T> read_raw(const std::string &path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) fail("cannot read " + path);
-    std::vector<T> v(size_t(f.tellg()) / sizeof(T));
-    f.seekg(0);
-    f.read(reinterpret_cast<char *>(v.data()), std::streamsize(v.size() * sizeof(T)));
-    return v;
-}
-
 template <typename T>
 void dump(const std::string &dir, const std::string &name, const std::vector<T> &v) {
     if (dir.empty()) return;
@@ -62,9 +51,8 @@ public:
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
         phase("text/DiT/VAE kernels");
-        if (dir_->has_axmodel("vision-vit")) vit_ = std::make_unique<VisionEncoder>(*dir_);
-        if (dir_->has_axmodel("image-vae-encode")) {
-            vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
+        has_edit_kernels_ = dir_->has_axmodel("vision-vit") && dir_->has_axmodel("image-vae-encode");
+        if (has_edit_kernels_) {
             std::ifstream cf(dir_->file("vae/config.json"));
             auto cfg = nlohmann::json::parse(cf);
             latents_mean_ = cfg.at("latents_mean").get<std::vector<float>>();
@@ -72,7 +60,6 @@ public:
             if (latents_mean_.size() != size_t(kLatentChannels) || latents_std_.size() != size_t(kLatentChannels))
                 fail("vae/config.json: latents_mean/std must have 24 entries");
         }
-        phase("edit kernels (ViT, VAE encoder)");
         if (!opt.lora_dir.empty())
             lora_ = std::make_unique<LoraManager>(opt.lora_dir, dir_->file("dit/shared.safetensors"), opt.lora_cache,
                                                   dit_->lora_ranks());
@@ -143,10 +130,10 @@ public:
     Runtime &runtime() override { return *rt_; }
 
     // Edit needs the edit DiT kernels + AdaLN table, the paged deepstack text kernels, the VAE encoder and vision
-    // features (the ViT kernel, or AXD_EDIT_VISION=<dir> with precomputed features for testing).
+    // features (the ViT kernels). Those two are large files the engine takes ~13 s to load, and it cannot load them
+    // while other threads copy to the device, so they are loaded by the first edit request.
     bool edit_ready() const {
-        return dit_->supports_edit() && text_->supports_vision() && vae_enc_ &&
-               (vit_ || std::getenv("AXD_EDIT_VISION"));
+        return dit_->supports_edit() && text_->supports_vision() && has_edit_kernels_;
     }
 
     Result run(const Request &req, Progress &progress) override {
@@ -228,6 +215,13 @@ public:
         rt_->bind_thread();
         Result r;
         double t_all = now_s();
+        if (!vit_) {
+            progress("load_edit");
+            vit_ = std::make_unique<VisionEncoder>(*dir_);
+            vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
+            r.seconds["edit_load"] = now_s() - t_all;
+            AXD_LOG("edit kernels (ViT, VAE encoder): %.1f s", r.seconds["edit_load"]);
+        }
         const int n_ref = int(req.images.size());
         TorchGenerator gen(req.seed);
 
@@ -289,19 +283,14 @@ public:
         std::vector<std::vector<float>> pixel_values(n_ref);
         for (int k = 0; k < n_ref; ++k) pixel_values[k] = edit::vit_pixel_values(vit_copies[k], grids[k]);
         std::vector<uint16_t> merger, ds[3];
-        if (const char *vd = std::getenv("AXD_EDIT_VISION")) {  // testing: precomputed features for these inputs
-            merger = read_raw<uint16_t>(std::string(vd) + "/vision_merger.bf16");
-            for (int i = 0; i < 3; ++i) ds[i] = read_raw<uint16_t>(std::string(vd) + "/vision_deepstack_" + std::to_string(i) + ".bf16");
-        } else {
-            for (int k = 0; k < n_ref; ++k) {  // one image per launch chain; features concatenated in reference order
-                auto f = vit_->encode(pixel_values[k], grids[k][1], grids[k][2]);
-                merger.insert(merger.end(), f.merger.begin(), f.merger.end());
-                for (int i = 0; i < 3; ++i) ds[i].insert(ds[i].end(), f.deepstack[i].begin(), f.deepstack[i].end());
-                if (!req.dump_dir.empty()) {
-                    dump(req.dump_dir, "vision_merger_" + std::to_string(k) + ".bf16", f.merger);
-                    for (int i = 0; i < 3; ++i)
-                        dump(req.dump_dir, "vision_deepstack" + std::to_string(i) + "_" + std::to_string(k) + ".bf16", f.deepstack[i]);
-                }
+        for (int k = 0; k < n_ref; ++k) {  // one image per launch chain; features concatenated in reference order
+            auto f = vit_->encode(pixel_values[k], grids[k][1], grids[k][2]);
+            merger.insert(merger.end(), f.merger.begin(), f.merger.end());
+            for (int i = 0; i < 3; ++i) ds[i].insert(ds[i].end(), f.deepstack[i].begin(), f.deepstack[i].end());
+            if (!req.dump_dir.empty()) {
+                dump(req.dump_dir, "vision_merger_" + std::to_string(k) + ".bf16", f.merger);
+                for (int i = 0; i < 3; ++i)
+                    dump(req.dump_dir, "vision_deepstack" + std::to_string(i) + "_" + std::to_string(k) + ".bf16", f.deepstack[i]);
             }
         }
         r.seconds["vision"] = now_s() - t0;
@@ -370,6 +359,7 @@ private:
     std::unique_ptr<Vae> vae_;
     std::unique_ptr<VaeEncoder> vae_enc_;
     std::unique_ptr<VisionEncoder> vit_;
+    bool has_edit_kernels_ = false;
     std::vector<float> latents_mean_, latents_std_;
     std::unique_ptr<LoraManager> lora_;
     double load_s_ = 0;

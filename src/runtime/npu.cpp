@@ -247,6 +247,7 @@ Model::Model(const std::string &path) : path_(path) {
         check(axclrtEngineLoadFromFile(path.c_str(), &model_id_), "load " + path);
     } else {
         // read with several workers (one stream is ~0.7 GB/s on the board's NVMe, four ~1.9 GB/s), then upload
+        const double tp0 = now_s();
         std::unique_ptr<uint8_t[]> host(new uint8_t[bytes]);
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) fail("cannot open " + path);
@@ -270,11 +271,17 @@ Model::Model(const std::string &path) : path_(path) {
         for (auto &t : pool) t.join();
         ::close(fd);
         if (bad) fail("short read: " + path);
+        const double tp1 = now_s();
         DeviceBuffer staging(bytes, "model-staging");
         staging.buf().upload(host.get(), bytes);
+        const double tp2 = now_s();
         check(axclrtEngineLoadFromMem(staging.buf().ptr, bytes, &model_id_), "load (from device memory) " + path);
+        if (std::getenv("AXD_LOAD_PROF"))
+            fprintf(stderr, "[prof] %zu MB read %.2f upload %.2f load %.2f\n", bytes >> 20, tp1 - tp0, tp2 - tp1, now_s() - tp2);
     }
+    const double tc0 = now_s();
     check(axclrtEngineCreateContext(model_id_, &context_id_), "CreateContext " + path);
+    if (std::getenv("AXD_LOAD_PROF") && bytes > (64u << 20)) fprintf(stderr, "[prof] context %.2f\n", now_s() - tc0);
     axclrtEngineIOInfo info = nullptr;
     check(axclrtEngineGetIOInfo(model_id_, &info), "GetIOInfo " + path);
     io_info_ = info;

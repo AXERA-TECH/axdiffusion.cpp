@@ -80,6 +80,8 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
         refiner_[kv.first].granule = 512;
         refiner_[kv.first].what = "dit-refiner " + std::to_string(kv.first) + "-row";
     }
+    context_proj_.path = dir.axmodel("dit-context-proj");
+    context_proj_.what = "dit-context-proj";
     for (auto &kv : dir.tiers("dit-refiner-norm", "")) rmsnorm_[kv.first].path = kv.second;
     for (auto &kv : block_)
         if (!final_.count(kv.first)) fail("DiT tier " + std::to_string(kv.first) + " has a block but no final kernel");
@@ -220,13 +222,26 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     }
     text_rows_ = text_rows;
 
-    // 1) text projection 5120 -> 5376 on the host (any prompt length)
-    std::vector<float> xt(size_t(text_rows) * kDitTextDim);
-    for (size_t i = 0; i < xt.size(); ++i) xt[i] = bf16_to_f32(text_hidden[i]);
+    // 1) text projection 5120 -> 5376 on the NPU, one 256-row page per launch (any prompt length)
     std::vector<uint16_t> proj(size_t(text_rows) * kDitHidden);
-    const double tl = now_s();
-    host_linear(xt.data(), text_rows, kDitTextDim, w_.context_w, w_.context_b, kDitHidden, proj.data());
-    AXD_LOG("text projection %d rows: %.2f s", text_rows, now_s() - tl);
+    {
+        const double tl = now_s();
+        const int page = 256;
+        if (!ctx_in_.size()) {
+            ctx_in_ = DeviceBuffer(size_t(page) * kDitTextDim * 2, "dit-context-in");
+            ctx_out_ = DeviceBuffer(size_t(page) * kDitHidden * 2, "dit-context-out");
+        }
+        Model &m = context_proj_.get();
+        for (int r0 = 0; r0 < text_rows; r0 += page) {
+            const int n = std::min(page, text_rows - r0);
+            if (n < page) ctx_in_.buf().fill_zero();
+            ctx_in_.buf().upload(text_hidden.data() + size_t(r0) * kDitTextDim, size_t(n) * kDitTextDim * 2);
+            m.run({{"x", ctx_in_}, {"weight", w_.shared->get("context.weight")}, {"bias", w_.shared->get("context.bias")}},
+                  {{"output", ctx_out_}});
+            ctx_out_.buf().view(0, size_t(n) * kDitHidden * 2).download(proj.data() + size_t(r0) * kDitHidden, size_t(n) * kDitHidden * 2);
+        }
+        AXD_LOG("text projection %d rows: %.2f s", text_rows, now_s() - tl);
+    }
 
     // 2) token refiner (2 layers) + RMSNorm on the NPU
     int rows = 0;
@@ -475,8 +490,7 @@ std::unique_ptr<DitWeights> load_dit_weights(const ModelDir &dir) {
         add_all(*w->shared, st, st.names());
         w->proj_in_w = to_f32(st.get("proj_in.weight"));
         w->proj_in_b = to_f32(st.get("proj_in.bias"));
-        w->context_w = to_f32(st.get("context.weight"));
-        w->context_b = to_f32(st.get("context.bias"));
+        if (st.get("context.weight").dtype != "BF16") fail("dit/shared.safetensors context.weight must be bf16");
     }
     files.push_back(std::make_unique<SafeTensors>(dir.file("dit/adaln.safetensors")));
     {
