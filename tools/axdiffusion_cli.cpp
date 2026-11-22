@@ -1,5 +1,5 @@
 // axdiffusion-cli: run one request (or N repeats) from the command line.
-//   axdiffusion-cli --model DIR --prompt TEXT [--size 1024 | --width W --height H] [--seed N] [--out out.png]
+//   axdiffusion-cli --model DIR --prompt TEXT [--size N | WxH] [--seed N] [--out out.png]
 //                   [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]... [--repeat N] [--steps N]
 //                   [--blocks N] [--dump-dir DIR] [--quiet]
 #include <cstdio>
@@ -12,7 +12,7 @@
 
 static void usage() {
     std::fprintf(stderr,
-                 "usage: axdiffusion-cli --model DIR --prompt TEXT [--size 1024|2048] [--width W --height H]\n"
+                 "usage: axdiffusion-cli --model DIR --prompt TEXT [--size N|WxH]\n"
                  "                       [--seed N] [--out PNG] [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]...\n"
                  "                       [--repeat N] [--steps N] [--blocks N] [--dump-dir DIR] [--quiet]\n");
 }
@@ -33,7 +33,15 @@ int main(int argc, char **argv) {
         };
         if (a == "--model") model_dir = next();
         else if (a == "--prompt") req.prompt = next();
-        else if (a == "--size") req.width = req.height = std::stoi(next());
+        else if (a == "--size") {  // N (square) or WxH
+            const std::string v = next();
+            const size_t x = v.find_first_of("xX");
+            const std::string w = v.substr(0, x), h = x == std::string::npos ? w : v.substr(x + 1);
+            auto digits = [](const std::string &t) { return !t.empty() && t.size() < 6 && t.find_first_not_of("0123456789") == std::string::npos; };
+            if (!digits(w) || !digits(h)) { std::fprintf(stderr, "bad --size %s (use N or WxH)\n", v.c_str()); return 2; }
+            req.width = std::stoi(w);
+            req.height = std::stoi(h);
+        }
         else if (a == "--width") req.width = std::stoi(next());
         else if (a == "--height") req.height = std::stoi(next());
         else if (a == "--seed") req.seed = std::stoull(next());
