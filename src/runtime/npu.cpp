@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <fcntl.h>
@@ -25,15 +26,31 @@ void check(axclError rc, const std::string &what) {
 // Large single DMA transfers can fail with ENOMEM on a busy board; copy in chunks.
 constexpr size_t kCopyChunk = 16u << 20;
 
+// The DMA driver takes its host pages without waiting for reclaim, so a copy fails (ENOMEM / EINVAL) while the
+// host's free memory is used up by the page cache. The failed allocation wakes the kernel's reclaim, so the
+// same copy succeeds shortly after: retry with a growing pause before giving up.
+void copy_retry(void *dst, const void *src, size_t n, axclrtMemcpyKind kind, const char *what) {
+    int rc = 0;
+    for (int attempt = 0; attempt < 60; ++attempt) {
+        rc = axclrtMemcpy(dst, src, n, kind);
+        if (rc == 0) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(20 * (attempt + 1), 500)));
+    }
+    check(rc, what);
+}
+
 void memcpy_chunked(void *dst, const void *src, size_t n, axclrtMemcpyKind kind) {
     auto *d = static_cast<uint8_t *>(dst);
     auto *s = static_cast<const uint8_t *>(src);
     for (size_t done = 0; done < n;) {
         size_t step = std::min(kCopyChunk, n - done);
-        check(axclrtMemcpy(d + done, s + done, step, kind), "axclrtMemcpy");
+        copy_retry(d + done, s + done, step, kind, "axclrtMemcpy");
         done += step;
     }
 }
+
+// Weight files are read once; leaving them in the page cache only takes free memory away from the DMA driver.
+void drop_cache(int fd, uint64_t offset, size_t n) { ::posix_fadvise(fd, off_t(offset), off_t(n), POSIX_FADV_DONTNEED); }
 
 }  // namespace
 
@@ -111,8 +128,7 @@ void Buf::fill_zero() const {
     static const std::vector<uint8_t> zeros(kCopyChunk, 0);
     for (size_t done = 0; done < size;) {
         size_t step = std::min(kCopyChunk, size - done);
-        check(axclrtMemcpy(static_cast<uint8_t *>(ptr) + done, zeros.data(), step, AXCL_MEMCPY_HOST_TO_DEVICE),
-              "axclrtMemcpy(zero)");
+        copy_retry(static_cast<uint8_t *>(ptr) + done, zeros.data(), step, AXCL_MEMCPY_HOST_TO_DEVICE, "axclrtMemcpy(zero)");
         done += step;
     }
 }
@@ -215,6 +231,7 @@ void materialize_parallel(const std::vector<TensorBank *> &banks, unsigned threa
                     if (r <= 0) fail("weight file read failed");
                     done += size_t(r);
                 }
+                drop_cache(j.fd, j.file_offset, j.n);
                 j.dst.upload(buf.data(), j.n);
             }
         } catch (const std::exception &e) {
@@ -264,6 +281,7 @@ Model::Model(const std::string &path) : path_(path) {
                     }
                     p += size_t(r);
                 }
+                drop_cache(fd, o, end - o);
             }
         };
         std::vector<std::thread> pool;

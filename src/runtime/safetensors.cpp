@@ -101,6 +101,8 @@ void SafeTensors::read_all(const std::vector<std::string> &prefixes, unsigned th
                 }
                 o += size_t(r);
             }
+            // read once: do not leave it in the page cache (the NPU's DMA driver needs free host memory)
+            ::posix_fadvise(fd_, off_t(pieces[i].first), off_t(pieces[i].second - pieces[i].first), POSIX_FADV_DONTNEED);
         }
     };
     std::vector<std::thread> pool;
