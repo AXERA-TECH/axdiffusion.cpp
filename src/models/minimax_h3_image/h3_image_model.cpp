@@ -51,7 +51,7 @@ public:
         dit_ = std::make_unique<Dit>(*dir_, *dit_w_);
         vae_ = std::make_unique<Vae>(*dir_, *vae_w_);
         phase("text/DiT/VAE kernels");
-        has_edit_kernels_ = dir_->has_axmodel("vision-vit") && dir_->has_axmodel("image-vae-encode");
+        has_edit_kernels_ = VisionEncoder::available(*dir_) && dir_->has_axmodel("image-vae-encode");
         if (has_edit_kernels_) {
             std::ifstream cf(dir_->file("vae/config.json"));
             auto cfg = nlohmann::json::parse(cf);
