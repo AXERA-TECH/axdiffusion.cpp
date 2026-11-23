@@ -144,13 +144,18 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .msg.on{display:block;animation:pop .2s ease-out}
 .msg.calm{border-color:var(--line);color:var(--muted);background:transparent}
 
-.strip{border-top:1px solid var(--line);padding:10px 26px 12px;display:flex;gap:8px;overflow-x:auto;min-height:92px;align-items:center}
+.strip{border-top:1px solid var(--line);padding:14px 26px 12px;display:flex;gap:8px;overflow-x:auto;min-height:92px;align-items:center}
 .strip:empty{display:none}
-.thumb{flex:none;height:68px;border:2px solid transparent;border-radius:3px;padding:0;background:var(--field);overflow:hidden;animation:pop .25s ease-out;transition:border-color .15s,transform .15s}
+.thumb{flex:none;position:relative;height:68px;animation:pop .25s ease-out;transition:transform var(--in) var(--ease)}
+.thumb .pic{height:100%;border:2px solid transparent;border-radius:3px;padding:0;background:var(--field);overflow:hidden;display:block;transition:border-color var(--in) var(--ease)}
 .thumb img{height:100%;display:block}
+.thumb .del{position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:50%;border:0;background:var(--deep);color:#fff;font-size:12px;line-height:20px;padding:0;opacity:0;transition:opacity var(--in) var(--ease),background var(--in) var(--ease)}
+.thumb:hover .del,.thumb .del:focus-visible{opacity:1}
+.thumb .del:hover{background:var(--bad)}
+@media (hover:none){.thumb .del{opacity:1}}
 @media (hover:hover) and (pointer:fine){.thumb:hover{transform:translateY(-2px)}.thumb:hover img{transform:scale(1.03)}}
 .thumb img{transition:transform 600ms var(--ease)}
-.thumb[aria-current=true]{border-color:var(--sun)}
+.thumb[aria-current=true] .pic{border-color:var(--sun)}
 
 #viewer{position:fixed;inset:0;background:rgba(4,18,29,.94);display:none;z-index:9;overflow:auto;cursor:zoom-out}
 #viewer.on{display:block;animation:fade .18s ease-out}
@@ -470,11 +475,27 @@ function b64Blob(b64){ const bin = atob(b64), a = new Uint8Array(bin.length); fo
 function addShot(b64, prompt, info, loras){
   const blob = b64Blob(b64), url = URL.createObjectURL(blob);
   S.shots.push({url, blob, prompt, info, loras});
-  const i = S.shots.length - 1;
-  const t = el('button', {type: 'button', className: 'thumb', title: prompt}, el('img', {src: url, alt: prompt}));
-  t.onclick = () => show(i, false);
-  $('#strip').prepend(t);
-  show(i, true);
+  drawStrip(); show(S.shots.length - 1, true);
+}
+function drawStrip(){
+  $('#strip').replaceChildren(...S.shots.map((s, i) => {
+    const pic = el('button', {type: 'button', className: 'pic', title: s.prompt}, el('img', {src: s.url, alt: s.prompt}));
+    pic.onclick = () => show(i, false);
+    const del = el('button', {type: 'button', className: 'del', textContent: '×', title: '从历史里删掉这张'});
+    del.setAttribute('aria-label', '从历史里删掉这张');
+    del.onclick = () => removeShot(i);
+    const t = el('div', {className: 'thumb'}, pic, del); t.setAttribute('aria-current', i === S.current); return t;
+  }).reverse());
+}
+function removeShot(i){
+  URL.revokeObjectURL(S.shots[i].url); S.shots.splice(i, 1);
+  if (!S.shots.length) {
+    S.current = -1; drawStrip(); $('#result').classList.remove('on');
+    if (!S.running) { $('#out').hidden = true; $('#empty').hidden = false; fitFrame(); }
+    return;
+  }
+  const was = S.current; S.current = i < was ? was - 1 : Math.min(was, S.shots.length - 1);
+  drawStrip(); if (i === was && !S.running) show(S.current, false);
 }
 function show(i, fresh){
   if (S.running && !fresh) { /* allow browsing while the next one is cooking */ }
