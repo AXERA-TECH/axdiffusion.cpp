@@ -96,6 +96,48 @@ public:
         return i;
     }
 
+    // Tokens the prompt may use. Editing spends part of the text encoder's context on the reference labels and
+    // vision tokens, and the DiT sequence also carries the reference and target rows.
+    int edit_prompt_limit(int overhead, int reference_rows, int width, int height) const {
+        return std::max(0, std::min(text_->max_tokens() - overhead,
+                                    dit_->max_edit_rows() - overhead - reference_rows - image_rows(width, height)));
+    }
+
+    PromptBudget prompt_budget(const std::string &prompt, int width, int height,
+                               const std::vector<std::array<int, 2>> &reference_sizes) const override {
+        PromptBudget b;
+        if (reference_sizes.empty()) {
+            b.limit = std::max(0, std::min(text_->max_tokens(), dit_->max_text_rows(image_rows(width, height))));
+        } else {
+            int overhead = 0, reference_rows = 0;
+            for (size_t k = 0; k < reference_sizes.size(); ++k) {
+                auto vit = edit::vit_size(reference_sizes[k][0], reference_sizes[k][1]);
+                auto vae = edit::vae_size(reference_sizes[k][0], reference_sizes[k][1]);
+                overhead += int(tok_->encode("Picture " + std::to_string(k + 1) + ": ").size()) + 2 +
+                            (vit[0] / edit::kVitPatch) * (vit[1] / edit::kVitPatch) / (edit::kVitMerge * edit::kVitMerge);
+                reference_rows += (vae[0] / 32) * (vae[1] / 32);
+            }
+            b.limit = edit_prompt_limit(overhead, reference_rows, width, height);
+        }
+        auto count = [&](const std::string &s) { return int(tok_->encode(s).size()); };
+        b.tokens = count(prompt);
+        if (b.tokens > b.limit) {
+            // Longest prefix, cut on a code point, that still fits: token count grows with the prefix.
+            std::vector<size_t> starts;
+            for (size_t i = 0; i < prompt.size(); ++i)
+                if ((static_cast<unsigned char>(prompt[i]) & 0xC0) != 0x80) starts.push_back(i);
+            size_t lo = 0, hi = starts.size();  // code points kept
+            while (lo < hi) {
+                size_t mid = (lo + hi + 1) / 2;
+                size_t bytes = mid < starts.size() ? starts[mid] : prompt.size();
+                if (count(prompt.substr(0, bytes)) <= b.limit) lo = mid;
+                else hi = mid - 1;
+            }
+            b.cut_chars = int(lo);
+        }
+        return b;
+    }
+
     // Image rows of a W x H output (patch 2x2 on the 16x latent).
     static int image_rows(int w, int h) { return (w / 32) * (h / 32); }
 
@@ -309,6 +351,15 @@ public:
         std::vector<std::vector<int32_t>> labels(n_ref);
         for (int k = 0; k < n_ref; ++k) labels[k] = tok_->encode("Picture " + std::to_string(k + 1) + ": ");
         auto prompt_ids = tok_->encode(req.prompt);
+        {
+            const int overhead = int(edit::make_presentation(labels, {}, grids).ids.size());
+            const int limit = edit_prompt_limit(overhead, int(de.reference_rows.size() / kPatchDim), req.width, req.height);
+            if (limit <= 0) fail("the reference images leave no room for a prompt at this output size");
+            if (int(prompt_ids.size()) > limit) {
+                prompt_ids.resize(limit);
+                r.truncated = true;
+            }
+        }
         auto pres = edit::make_presentation(labels, prompt_ids, grids);
         auto mrope = edit::mrope_positions(pres, grids);
         TextVision tv;

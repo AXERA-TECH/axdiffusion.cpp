@@ -1,0 +1,5 @@
+// Generated at configure time from web/index.html: the page built into axdiffusion-server, used when the server
+// is started without --web-dir.
+#pragma once
+
+static const char *kWebUi = R"AXDWEB(@AXD_WEB_HTML@)AXDWEB";

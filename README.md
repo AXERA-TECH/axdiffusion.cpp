@@ -66,6 +66,10 @@ make -C build -j8
     --lora-dir /data/loras --out-dir ./output
 ```
 
+浏览器打开 `http://<板子地址>:18500/` 就是内置的生图网页。网页源文件是 `web/index.html`，编译时内嵌进程序。
+想改网页又不想重新编译，启动时加 `--web-dir <目录>`：服务每次请求都从 `<目录>/index.html` 读取页面，
+改完刷新浏览器即可生效，目录里的其他文件挂在 `/web/` 下。
+
 | API | 路径 |
 |---|---|
 | OpenAI Images | `POST /v1/images/generations`，`GET /v1/models` |

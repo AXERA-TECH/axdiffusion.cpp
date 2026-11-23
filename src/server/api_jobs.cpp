@@ -81,6 +81,21 @@ void register_jobs(httplib::Server &srv, ServerContext &ctx) {
             json_error(res, 400, e.what());
         }
     });
+    // POST /v1/tokenize {prompt, width, height, references:[[w,h],...]} -> {tokens, limit, cut_chars}
+    // Counts prompt tokens against what the model reads for that size; does not use the NPU.
+    srv.Post("/v1/tokenize", [&](const httplib::Request &http, httplib::Response &res) {
+        try {
+            auto b = nlohmann::json::parse(http.body);
+            std::vector<std::array<int, 2>> refs;
+            for (auto &s : b.value("references", nlohmann::json::array())) refs.push_back({s.at(0).get<int>(), s.at(1).get<int>()});
+            auto pb = ctx.model.prompt_budget(b.value("prompt", std::string()), b.value("width", 1024),
+                                              b.value("height", 1024), refs);
+            res.set_content(nlohmann::json{{"tokens", pb.tokens}, {"limit", pb.limit}, {"cut_chars", pb.cut_chars}}.dump(),
+                            "application/json");
+        } catch (const std::exception &e) {
+            json_error(res, 400, e.what());
+        }
+    });
     srv.Get(R"(/v1/jobs/([A-Za-z0-9_]+))", [&](const httplib::Request &http, httplib::Response &res) {
         auto job = ctx.queue.find(http.matches[1].str());
         if (!job) return json_error(res, 404, "job not found");

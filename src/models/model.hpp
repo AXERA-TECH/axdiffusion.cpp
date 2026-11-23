@@ -28,12 +28,22 @@ struct ModelInfo {
     bool lora = false;
 };
 
+// How much of a prompt the model will read for a given request shape.
+struct PromptBudget {
+    int tokens = 0;      // tokens in the whole prompt
+    int limit = 0;       // tokens the model accepts for this size / these references
+    int cut_chars = -1;  // Unicode code points of the prompt that fit; -1 when everything fits
+};
+
 class ModelPlugin {
 public:
     virtual ~ModelPlugin() = default;
     virtual ModelInfo info() const = 0;
     // Runs one request on the calling thread (which must own the NPU, see Runtime::bind_thread).
     virtual Result run(const Request &req, Progress &progress) = 0;
+    // Thread-safe, does not touch the NPU. reference_sizes are {width, height} of the edit references (empty: txt2img).
+    virtual PromptBudget prompt_budget(const std::string &prompt, int width, int height,
+                                       const std::vector<std::array<int, 2>> &reference_sizes) const = 0;
     virtual std::vector<std::string> loras() const { return {}; }
     virtual double load_seconds() const = 0;
     virtual Runtime &runtime() = 0;

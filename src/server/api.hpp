@@ -16,6 +16,7 @@ struct ServerContext {
     JobQueue &queue;
     std::string out_dir;     // images returned by URL
     std::string model_name;  // id reported to clients
+    std::string web_dir;     // when set, "/" serves <web_dir>/index.html from disk instead of the built-in page
 };
 
 void register_openai(httplib::Server &srv, ServerContext &ctx);  // /v1/models, /v1/images/*, /v1/loras, /files/*

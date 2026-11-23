@@ -11,6 +11,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fopenmp-simd")
 # AXCL runtime shipped with the board SDK. Override with -DAXCL_ROOT=/path/to/axcl
 set(AXCL_ROOT "/usr/local/axhelix" CACHE PATH "AXCL SDK root (contains include/ and lib/)")
 
+# The built-in web page is web/index.html, compiled in as a string. A running server can also read the page from
+# a directory (--web-dir), so the page can be edited without rebuilding.
+file(READ ${CMAKE_SOURCE_DIR}/web/index.html AXD_WEB_HTML)
+configure_file(src/server/web_ui.hpp.in ${CMAKE_BINARY_DIR}/gen/web_ui.hpp @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/web/index.html)
+
 file(GLOB AXD_SOURCES CONFIGURE_DEPENDS
   src/runtime/*.cpp
   src/components/*/*.cpp
@@ -22,7 +28,7 @@ target_include_directories(axdcore PUBLIC
   src/runtime
   src/components/tokenizer src/components/text_qwen src/components/dit_h3 src/components/lora src/components/vae_image src/components/vision_qwen
   src/models src/models/minimax_h3_image
-  src/server
+  src/server ${CMAKE_BINARY_DIR}/gen
   third_party ${AXCL_ROOT}/include)
 target_link_directories(axdcore PUBLIC ${AXCL_ROOT}/lib)
 target_link_libraries(axdcore PUBLIC axcl_rt pthread ${CMAKE_DL_LIBS})

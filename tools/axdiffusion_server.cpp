@@ -1,7 +1,9 @@
 // axdiffusion-server: loads one model directory, keeps every weight resident on the NPU and serves it over HTTP.
 //
 //   axdiffusion-server --model DIR [--host 0.0.0.0] [--port 18500] [--out-dir ./output] [--model-name NAME]
-//                      [--lora-dir DIR] [--lora-cache N]
+//                      [--lora-dir DIR] [--lora-cache N] [--web-dir DIR]
+//
+// --web-dir DIR serves DIR/index.html as the web page (read on every request) in place of the built-in one.
 //
 // APIs: web UI (/), OpenAI Images (/v1/images/*), A1111 (/sdapi/v1/*), async jobs (/v1/jobs), /health.
 // One NPU worker runs requests in order; SIGINT/SIGTERM stop accepting work and let the running job finish.
@@ -20,7 +22,7 @@ static void on_signal(int) {
 }
 
 int main(int argc, char **argv) {
-    std::string model_dir, host = "0.0.0.0", out_dir = "output", model_name;
+    std::string model_dir, host = "0.0.0.0", out_dir = "output", model_name, web_dir;
     int port = 18500;
     axd::ModelOptions opt;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -30,6 +32,7 @@ int main(int argc, char **argv) {
         else if (a == "--port") port = std::stoi(v);
         else if (a == "--out-dir") out_dir = v;
         else if (a == "--model-name") model_name = v;
+        else if (a == "--web-dir") web_dir = v;
         else if (a == "--lora-dir") opt.lora_dir = v;
         else if (a == "--lora-cache") opt.lora_cache = std::stoi(v);
         else if (a == "--device") opt.device = std::stoi(v);
@@ -41,7 +44,7 @@ int main(int argc, char **argv) {
     if (model_dir.empty()) {
         std::fprintf(stderr,
                      "usage: axdiffusion-server --model DIR [--host H] [--port P] [--out-dir DIR] [--model-name ID]\n"
-                     "                          [--lora-dir DIR] [--lora-cache N]\n");
+                     "                          [--lora-dir DIR] [--lora-cache N] [--web-dir DIR]\n");
         return 2;
     }
     std::unique_ptr<axd::ModelPlugin> model;
@@ -57,7 +60,7 @@ int main(int argc, char **argv) {
     int rc = 0;
     {
         axd::JobQueue queue(*model);
-        axd::ServerContext ctx{*model, queue, out_dir, model_name};
+        axd::ServerContext ctx{*model, queue, out_dir, model_name, web_dir};
         httplib::Server srv;
         srv.set_read_timeout(600, 0);
         srv.set_write_timeout(600, 0);

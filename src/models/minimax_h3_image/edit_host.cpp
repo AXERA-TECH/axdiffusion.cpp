@@ -118,6 +118,16 @@ Image resize_for_vae(const Image &in) {
     return (s[0] == in.width && s[1] == in.height) ? in : resize_lanczos(in, s[0], s[1]);
 }
 
+std::array<int, 2> vae_size(int width, int height) {
+    auto s = bound_short_edge(width, height, 1024, 2048, 32);
+    return {s[0], s[1]};
+}
+
+std::array<int, 2> vit_size(int width, int height) {
+    auto s = bound_short_edge(width, height, 1024, 1024, 32);
+    return {s[0], s[1]};
+}
+
 Image resize_for_vit(const Image &in) {
     auto s = bound_short_edge(in.width, in.height, 1024, 1024, 32);
     return (s[0] == in.width && s[1] == in.height) ? in : resize_lanczos(in, s[0], s[1]);

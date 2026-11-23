@@ -24,6 +24,9 @@ Image resize_lanczos(const Image &in, int out_w, int out_h);
 
 Image resize_for_vae(const Image &in);  // short edge into [1024, 2048], multiple of 32
 Image resize_for_vit(const Image &in);  // short edge 1024, multiple of 32
+// {width, height} the two resizes above produce for a source of this size (no pixels touched).
+std::array<int, 2> vae_size(int width, int height);
+std::array<int, 2> vit_size(int width, int height);
 
 // uint8 RGB -> ImageNet-normalized CHW float, cropped to a multiple of 16.
 std::vector<float> vae_pixels(const Image &img, int &h, int &w);

@@ -1,8 +1,4 @@
-// Single-page web UI served by axdiffusion-server at "/". Self-contained (no external assets), talks to the
-// server's own /v1/jobs, /v1/loras and /health endpoints.
-#pragma once
-
-static const char *kWebUi = R"HTML(<!doctype html>
+<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
@@ -42,8 +38,18 @@ button{cursor:pointer}
 textarea,input[type=number],select{width:100%;background:var(--field);border:1px solid var(--line);border-radius:var(--r-s);padding:9px 11px;transition:border-color 140ms var(--ease),box-shadow 140ms var(--ease)}
 textarea:hover,input[type=number]:hover,select:hover{border-color:var(--blue)}
 textarea:focus,input[type=number]:focus,select:focus{outline:0;border-color:var(--blue);box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 22%,transparent)}
-#prompt{min-height:112px;resize:vertical;line-height:1.6}
+.pwrap{position:relative}
+#prompt{min-height:112px;resize:vertical;line-height:1.6;display:block;position:relative;background:transparent}
+.pback{position:absolute;inset:0;border:1px solid transparent;border-radius:var(--r-s);padding:9px 11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:break-word;overflow:hidden;background:var(--field);color:transparent;pointer-events:none}
+.pwrap.split #prompt{color:transparent;caret-color:var(--ink)}
+.pwrap.split .pback .in{color:var(--ink)}
+.pwrap.split .pback .out{color:color-mix(in srgb,var(--muted) 55%,transparent);background:color-mix(in srgb,var(--muted) 10%,transparent);border-radius:2px}
+#count.over{color:var(--bad);font-weight:650}
+.note.over{color:var(--bad)}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
+.link{border:0;background:transparent;padding:0 0 0 8px;color:var(--blue);font-size:12px;text-decoration:underline;text-underline-offset:3px}
+.link:hover{color:var(--ink)}
+#ideas:not([hidden]){animation:pop .2s var(--ease)}
 .chip{background:transparent;border:1px solid var(--line);border-radius:var(--r-s);padding:5px 11px;font-size:12.5px;line-height:1.4;transition:background var(--out) var(--ease),border-color var(--out) var(--ease),color var(--out) var(--ease),transform var(--press) var(--ease)}
 .chip:active,.ghost:active{transform:translateY(1px) scale(.985)}
 .chip:hover{border-color:var(--blue)}
@@ -191,8 +197,10 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
   <div class="brand"><h1>axdiffusion</h1><span class="model" id="model"></span></div>
   <div class="form">
     <div class="field">
-      <div class="name"><label for="prompt">画面描述</label><span class="aux" id="count"></span></div>
-      <textarea id="prompt" placeholder="写下你想看到的画面，中英文都可以。例如：雨后的青石板小巷，一只橘猫蹲在木窗台上，傍晚暖光"></textarea>
+      <div class="name"><label for="prompt">画面描述</label><span class="aux"><span id="count"></span> <button class="link" id="ideasBtn" type="button" aria-expanded="false">看看示例</button></span></div>
+      <div class="pwrap"><div class="pback" id="pback" aria-hidden="true"></div><textarea id="prompt" placeholder="写下你想看到的画面，中英文都可以。写得越具体，出图越接近你想的"></textarea></div>
+      <div class="note over" id="overNote" hidden></div>
+      <div class="chips sub" id="ideas" hidden></div>
     </div>
 
     <div class="field" id="refField">
@@ -321,7 +329,7 @@ function drawSizes(){
   const [w, h] = chosenSize();
   $('#sizeAux').textContent = (w * h / 1e6).toFixed(1) + ' 百万像素' + (S.ratio === 'custom' ? '，宽高取 32 的倍数' : '');
   store.set('ratio', S.ratio); store.set('size', S.size);
-  fitFrame(); showEta();
+  fitFrame(); showEta(); if (typeof T !== 'undefined') count();
 }
 function nearest(list){
   const [w, h] = S.size.split('x').map(Number), area = w * h;
@@ -363,12 +371,13 @@ function drawLoras(){
 $('#loraPick').onchange = e => { if (e.target.value) { S.loras.push({name: e.target.value, scale: 1}); drawLoras(); } };
 
 /* ---------- reference images ---------- */
+const sized = url => new Promise(ok => { const i = new Image(); i.onload = () => ok(Object.assign(new String(url), {w: i.naturalWidth, h: i.naturalHeight})); i.onerror = () => ok(Object.assign(new String(url), {w: 1024, h: 1024})); i.src = url; });
 const readUrl = f => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(f); });
 async function addRefs(files){
   for (const f of files) {
     if (!f.type.startsWith('image/')) continue;
     if (S.refs.length >= S.maxRefs) { say('最多放 ' + S.maxRefs + ' 张参考图，多出来的没有加入'); break; }
-    S.refs.push(await readUrl(f));
+    S.refs.push(await sized(await readUrl(f)));
   }
   drawRefs();
 }
@@ -377,10 +386,11 @@ function drawRefs(){
     const x = el('button', {type: 'button', textContent: '×', title: '移除这张参考图'});
     x.setAttribute('aria-label', '移除第 ' + (i + 1) + ' 张参考图');
     x.onclick = () => { S.refs.splice(i, 1); drawRefs(); };
-    return el('div', {className: 'ref'}, el('img', {src: u, alt: ''}), x);
+    return el('div', {className: 'ref'}, el('img', {src: String(u), alt: ''}), x);
   }));
   $('#refAux').textContent = !S.canEdit ? '当前模型不支持' : S.refs.length ? S.refs.length + ' / ' + S.maxRefs + '，改图模式' : '可选，最多 ' + S.maxRefs + ' 张';
   $('#drop').hidden = !S.canEdit || S.refs.length >= S.maxRefs;
+  drawIdeas(); if (typeof T !== 'undefined') count();
   $('#go').textContent = S.running ? '停止生成' : (S.refs.length ? '按描述改图' : '生成图片');
   showEta();
 }
@@ -392,10 +402,54 @@ $('#file').onchange = e => { addRefs([...e.target.files]); e.target.value = ''; 
 $('#drop').addEventListener('drop', e => addRefs([...e.dataTransfer.files]));
 document.addEventListener('paste', e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length && S.canEdit) { e.preventDefault(); addRefs(fs); } });
 
+/* ---------- example prompts ---------- */
+const IDEAS = [{"t":"雨巷橘猫","size":"896x1184","p":"雨后的江南老巷，青石板路面积着浅浅的水洼，倒映着两侧白墙黛瓦。一只橘猫蹲在斑驳的木窗台上舔爪子，窗内透出暖黄的灯光。傍晚的天空是蓝灰色，空气里有薄雾，远处有一把红色油纸伞。35mm 胶片摄影，浅景深，颗粒细腻，色调温润。"},{"t":"人像特写","size":"896x1184","p":"一位二十多岁东亚女性的半身肖像，黑色短发被风吹起几缕，穿米白色粗针织毛衣，站在秋天的银杏树下，金黄的叶子在背景中虚化成光斑。她微微侧头看向镜头外，神情平静。下午四点的侧逆光勾出发丝轮廓，皮肤质感真实，能看到细小的毛孔和雀斑。85mm 镜头，f/1.8，自然光人像摄影。"},{"t":"雪山湖泊","size":"1568x672","p":"清晨的高山湖泊全景，湖水是通透的松石绿色，水面平静如镜，完整倒映着远处覆雪的锯齿状山峰。第一缕阳光把山尖染成粉橙色，山腰缠着一条薄薄的云带。近处岸边是深色的碎石和几丛枯黄的高山草，一艘红色小木船停在浅水里。超广角风光摄影，画面极其清晰，层次分明。"},{"t":"美食摄影","size":"1184x896","p":"一碗刚出锅的日式豚骨拉面的俯拍特写，奶白色浓汤表面浮着细密的油花，叉烧肉片边缘微焦，溏心蛋切开露出流动的橙色蛋黄，旁边是翠绿的葱花、黑木耳丝和一片海苔。热气从碗中升起。深色粗陶碗放在旧木桌上，一侧有窗光照进来，形成柔和的明暗对比。商业美食摄影，微距细节，质感诱人。"},{"t":"赛博夜市","size":"1376x768","p":"未来都市的雨夜街头夜市，狭窄的街道两侧挤满小吃摊，头顶是密密麻麻的霓虹灯牌，灯牌上只有抽象的几何图形和线条，粉色、青色和橙色的光映在湿漉漉的地面上。一个穿透明雨衣的行人撑着发光的伞走在画面中央，背对镜头。蒸汽从摊位的锅里升起，被霓虹灯染成彩色。远处是高耸的摩天楼和飞行器的光轨。电影感构图，变形宽银幕镜头，高对比度。"},{"t":"水墨山水","size":"832x1248","p":"一幅传统中国水墨山水立轴。远山用淡墨层层晕染，隐在云雾之中；中景是陡峭的石壁，几株苍劲的松树从岩缝中斜出；近处溪水边有一座茅草亭，亭中一位穿长衫的文人独坐抚琴。画面大量留白，墨色有浓淡干湿的变化，宣纸的纤维纹理清晰可见，右上角有一方朱红印章。"},{"t":"手绘海边小镇","size":"1248x832","p":"手绘动画风格的海边小镇，夏日午后。红瓦白墙的房子沿着山坡层层叠叠，一条蜿蜒的石阶路通向远处湛蓝的大海，海面上有白色的帆船。天空中是巨大蓬松的积雨云。前景有一个戴草帽的小女孩骑着自行车，车筐里装着向日葵。色彩明亮饱和，线条柔和，水彩质感的背景，充满怀旧而温暖的气氛。"},{"t":"产品渲染","size":"1024x1024","p":"一瓶高端香水的产品摄影。方形厚底玻璃瓶，瓶内是淡琥珀色液体，磨砂金属瓶盖。瓶子立在一块黑色湿润的火山岩上，周围散落着几片干燥的橙皮和一枝雪松。背景是深墨绿色渐变。一束窄光从左后方打来，让玻璃边缘和液体透出通透的高光，瓶身上有清晰的水珠。棚拍，极简构图，细节锐利。"},{"t":"微距昆虫","size":"1184x896","p":"清晨草叶上一只蜻蜓的极致微距照片。蜻蜓停在一根弯曲的草茎顶端，透明的翅膀上挂满细小的露珠，每一颗都折射出背景的光。复眼的六边形结构清晰可见，呈现蓝绿色的金属光泽。背景是完全虚化的柔和绿色和金色晨光光斑。100mm 微距镜头，景深极浅，焦点落在眼睛上。"},{"t":"3D 卡通角色","size":"1024x1024","p":"一只圆滚滚的小恐龙角色的三维卡通渲染，薄荷绿色的皮肤，背上有一排橙色的小圆刺，大大的黑眼睛带着高光，脸颊上有两团粉色腮红，正开心地举着一个比它还大的草莓冰淇淋。材质像柔软的搪胶玩具，表面有细腻的次表面散射。浅黄色纯色背景，柔和的棚灯，地面有淡淡的接触阴影。可爱，精致，皮克斯风格。"},{"t":"室内设计","size":"1376x768","p":"一间侘寂风格的客厅，午后阳光透过整面落地窗的亚麻纱帘洒进来，在微水泥地面上投下长长的光影。一张低矮的原木茶几，一组米色亚麻布艺沙发，墙边立着一只粗陶大花瓶，里面插着几枝干枯的芒草。墙面是带手工肌理的暖灰色灰泥。空间留白很多，安静克制。建筑室内摄影，24mm 移轴镜头，垂直线条笔直。"},{"t":"文字海报","size":"896x1184","p":"A minimalist vintage travel poster. A large orange sun sets behind layered teal mountain silhouettes, with a small steam train crossing a stone viaduct in the middle distance. Flat colors with subtle paper grain and screen-print texture. At the top, bold cream-colored sans-serif letters read \"AXERA EXPRESS\". Clean composition, limited palette of teal, orange and cream."}];
+const EDIT_IDEAS = [{"t":"改成水彩画","p":"把这张图改成水彩画风格，保留原来的构图和主体，颜色通透，有纸张纹理和自然的水渍晕染。"},{"t":"换成雪天","p":"把场景改成下雪的冬天，地面和物体表面覆盖一层积雪，空中飘着雪花，光线偏冷，主体保持不变。"},{"t":"改成夜晚","p":"把时间改成夜晚，天空变成深蓝色，亮起温暖的灯光，保留原来的构图和主体。"},{"t":"黏土动画风","p":"把这张图改成黏土定格动画风格，所有物体像手工捏的彩色黏土，表面有指纹和细小的不平整，柔和的棚灯。"},{"t":"铅笔素描","p":"把这张图改成铅笔素描，黑白灰调子，能看到排线和纸张颗粒，保留原来的构图。"}];
+function drawIdeas(){
+  const list = S.refs.length ? EDIT_IDEAS : IDEAS;
+  $('#ideasBtn').textContent = $('#ideas').hidden ? (S.refs.length ? '看看改图示例' : '看看示例') : '收起示例';
+  $('#ideas').replaceChildren(...list.map(x => {
+    const b = el('button', {type: 'button', className: 'chip', textContent: x.t, title: x.p});
+    b.onclick = () => {
+      $('#prompt').value = x.p; count();
+      if (x.size && S.sizes.includes(x.size)) { const [w, h] = x.size.split('x').map(Number); S.ratio = ratioOf(w, h); S.size = x.size; drawSizes(); }
+      $('#prompt').focus();
+    };
+    return b;
+  }));
+}
+$('#ideasBtn').onclick = () => { const box = $('#ideas'); box.hidden = !box.hidden; $('#ideasBtn').setAttribute('aria-expanded', !box.hidden); drawIdeas(); };
+
 /* ---------- small controls ---------- */
 $('#prompt').value = store.get('prompt', '');
-const count = () => { const n = $('#prompt').value.trim().length; $('#count').textContent = n ? n + ' 字' : ''; store.set('prompt', $('#prompt').value); };
-$('#prompt').oninput = count; count();
+/* Token budget: the server counts tokens with the model's own tokenizer and says how many characters fit for the
+   current size and references. Text past the limit is not read by the model, so it is shown faded. */
+const T = {timer: 0, seq: 0, cut: -1};
+function paintPrompt(){
+  const v = $('#prompt').value, wrap = document.querySelector('.pwrap'), back = $('#pback');
+  const cps = Array.from(v), over = T.cut >= 0 && T.cut < cps.length;
+  wrap.classList.toggle('split', over);
+  if (over) back.replaceChildren(el('span', {className: 'in', textContent: cps.slice(0, T.cut).join('')}), el('span', {className: 'out', textContent: cps.slice(T.cut).join('') + '\n'}));
+  else back.replaceChildren();
+  back.scrollTop = $('#prompt').scrollTop;
+}
+async function askTokens(){
+  const v = $('#prompt').value, my = ++T.seq, [w, h] = chosenSize();
+  try {
+    const r = await fetch('/v1/tokenize', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt: v, width: w, height: h, references: S.refs.map(u => [u.w, u.h])})});
+    if (!r.ok) throw 0;
+    const d = await r.json(); if (my !== T.seq) return;
+    T.cut = d.cut_chars; $('#count').textContent = d.tokens + ' / ' + d.limit; $('#count').title = '已用 token / 这个画幅下模型最多读取的 token';
+    $('#count').classList.toggle('over', d.tokens > d.limit);
+    $('#overNote').hidden = d.tokens <= d.limit;
+    $('#overNote').textContent = d.limit > 0 ? '超出 ' + (d.tokens - d.limit) + ' 个 token，变淡的部分模型不会读到' : '这个画幅和参考图已经占满序列，放不下描述。换小一点的画幅或少放参考图';
+  } catch (e) { if (my !== T.seq) return; T.cut = -1; $('#count').textContent = ''; $('#overNote').hidden = true; }
+  paintPrompt();
+}
+const count = () => { store.set('prompt', $('#prompt').value); paintPrompt(); clearTimeout(T.timer); T.timer = setTimeout(askTokens, 180); };
+$('#prompt').addEventListener('scroll', () => { $('#pback').scrollTop = $('#prompt').scrollTop; });
+$('#prompt').oninput = count;
 $('#seed').value = store.get('seed', 42);
 $('#seed').oninput = () => store.set('seed', $('#seed').value);
 function setRand(on){ $('#rand').setAttribute('aria-pressed', on); $('#seed').disabled = on; store.set('rand', on); }
@@ -424,7 +478,7 @@ function startProgress(hasLora, hasRef, idx, total){
   $('#segs').replaceChildren(...P.list.map(s => { const d = el('div', {className: 'seg'}, el('i')); d.style.setProperty('--w', s[2]); return d; }));
   $('#prog').classList.add('on'); $('#result').classList.remove('on'); say('');
   $('#bath').classList.add('on'); $('#out').hidden = true; $('#empty').hidden = true;
-  const u = $('#under'); u.hidden = !hasRef; if (hasRef) u.src = S.refs[0];
+  const u = $('#under'); u.hidden = !hasRef; if (hasRef) u.src = String(S.refs[0]);
   cancelAnimationFrame(P.raf); tick();
 }
 function onJob(j){
@@ -521,7 +575,7 @@ $('#reuse').onclick = () => {
 $('#asRef').onclick = async () => {
   const s = S.shots[S.current]; if (!s) return;
   if (S.refs.length >= S.maxRefs) return say('参考图已经放满 ' + S.maxRefs + ' 张，先移除一张');
-  S.refs.push(await readUrl(s.blob)); drawRefs(); $('#refField').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  S.refs.push(await sized(await readUrl(s.blob))); drawRefs(); $('#refField').scrollIntoView({behavior: 'smooth', block: 'nearest'});
 };
 $('#out').onclick = () => { const v = $('#viewer'); v.querySelector('img').src = $('#out').src; v.classList.remove('full'); v.classList.add('on'); };
 $('#viewer').onclick = e => { const v = $('#viewer'); if (e.target.tagName === 'IMG') v.classList.toggle('full'); else v.classList.remove('on'); };
@@ -551,7 +605,7 @@ function explain(msg){
 async function generate(){
   const prompt = $('#prompt').value.trim();
   if (!prompt) { say('先写一段画面描述'); $('#prompt').focus(); return; }
-  const [w, h] = chosenSize(), loras = S.loras.map(l => ({...l})), images = [...S.refs], n = S.n, rand = $('#rand').getAttribute('aria-pressed') === 'true';
+  const [w, h] = chosenSize(), loras = S.loras.map(l => ({...l})), images = S.refs.map(String), n = S.n, rand = $('#rand').getAttribute('aria-pressed') === 'true';
   const key = estKey(), base = parseInt($('#seed').value || '0');
   S.running = true; S.stop = false; $('#go').classList.add('stop'); $('#go').textContent = '停止生成'; $('#dot').className = 'dot busy'; $('#status').textContent = '生成中';
   $('#eta').textContent = '停止会在当前这一步结束后生效'; fitFrame([w, h]);
@@ -602,9 +656,8 @@ async function loadLoras(){
   if (S.loraNames.length) S.loras = S.loras.filter(l => S.loraNames.includes(l.name));
   drawLoras();
 }
-drawSizes(); drawRefs(); health(); loadLoras(); setInterval(health, 10000);
+count(); drawSizes(); drawRefs(); health(); loadLoras(); setInterval(health, 10000);
 addEventListener('resize', () => fitFrame());
 </script>
 </body>
 </html>
-)HTML";
