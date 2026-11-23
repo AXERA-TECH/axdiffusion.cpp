@@ -27,18 +27,26 @@
 例如放在 `/data/MiniMax-H3-Image-AX8860`。模型遵循 MiniMax-H3-Image Community License，
 使用前请阅读模型仓库中的 `LICENSE`。
 
-## 编译（在板上）
+## 编译
 
-需要 g++ ≥ 9、CMake ≥ 3.16，以及板上自带的 AXCL 运行时（默认 `/usr/local/axhelix`）。
+板端编译：
 
 ```bash
 git clone https://github.com/AXERA-TECH/axdiffusion.cpp.git
 cd axdiffusion.cpp
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release     # 运行时不在默认位置时加 -DAXCL_ROOT=/path/to/axcl
-make -C build -j8
+cmake -S . -B build
+cmake --build build -j8
 ```
 
-产物：`build/axdiffusion-cli`、`build/axdiffusion-server`。
+在 x86 主机上交叉编译（需要 Arm GNU 工具链 13.2 / 13.3 和板上 `/usr/local/axhelix` 的拷贝）：
+
+```bash
+cmake -S . -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-toolchain.cmake \
+      -DTOOLCHAIN_ROOT=/path/to/arm-gnu-toolchain -DAXCL_ROOT=/path/to/axhelix
+cmake --build build-aarch64 -j
+```
+
+产物是 `axdiffusion-cli` 和 `axdiffusion-server`。环境准备、部署、选项和常见问题见 [编译指南](docs/build.md)。
 
 ## 命令行
 
@@ -58,19 +66,6 @@ make -C build -j8
 | `--quiet` | 关闭进度日志 |
 
 每张图输出一行 JSON，包含各阶段耗时。
-
-## 交叉编译（在 x86 主机上）
-
-需要 Arm GNU 工具链 13.2 或 13.3（aarch64-none-linux-gnu），以及从板子拷下来的 `/usr/local/axhelix` 目录（含 `include/` 与 `lib/`）：
-
-```bash
-cmake -S . -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-toolchain.cmake \
-      -DTOOLCHAIN_ROOT=/path/to/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu \
-      -DAXCL_ROOT=/path/to/axhelix
-cmake --build build-aarch64 -j
-```
-
-把 `build-aarch64/axdiffusion-cli`、`axdiffusion-server` 拷到板上即可运行。板上运行库不在 `/usr/local/axhelix/lib` 时，加 `-DAXCL_RUNTIME_DIR=<板上目录>`。
 
 ## HTTP 服务
 
