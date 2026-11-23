@@ -26,7 +26,7 @@ void register_web(httplib::Server &srv, ServerContext &ctx) {
     if (!ctx.web_dir.empty()) srv.set_mount_point("/web", ctx.web_dir);
     srv.Get("/health", [&](const httplib::Request &, httplib::Response &res) {
         size_t used = 0, total = 0;
-        ctx.model.runtime().cmm(used, total);
+        ctx.queue.cmm(used, total);  // cached: the NPU runtime belongs to the worker thread
         auto info = ctx.model.info();
         nlohmann::json tasks = nlohmann::json::array(), sizes = nlohmann::json::array();
         for (auto t : info.tasks) tasks.push_back(task_name(t));

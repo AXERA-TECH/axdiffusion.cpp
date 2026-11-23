@@ -1,6 +1,7 @@
 // One NPU worker thread executing requests in submission order. HTTP threads only parse, submit and wait.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -8,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "model.hpp"
 
@@ -29,6 +31,17 @@ struct Job {
     Result result;
 };
 
+// One line of the queue as other clients may see it (no prompt, no images).
+struct QueueEntry {
+    std::string id, task, stage;
+    bool running = false;
+    int width = 0, height = 0, step = 0, total = 0;
+    double waited_s = 0;   // since submission
+    double elapsed_s = 0;  // since it started running
+    double expect_s = 0;   // how long a job of this shape took last time (0: unknown)
+    double start_in_s = 0; // estimated wait until it starts (0 for the running job)
+};
+
 class JobQueue {
 public:
     explicit JobQueue(ModelPlugin &model, size_t keep_finished = 64);
@@ -46,7 +59,15 @@ public:
     // Waits for any change of the job (progress or state) after `seen` updates; returns the new update count.
     uint64_t wait_update(const std::shared_ptr<Job> &job, uint64_t seen, double timeout_s);
     size_t pending() const;
+    // Running job first, then the waiting jobs in order, with time estimates from earlier jobs of the same shape.
+    std::vector<QueueEntry> snapshot() const;
     int served() const { return served_; }
+    // NPU memory in use, sampled by the worker thread between jobs. The NPU runtime is only ever called from that
+    // thread: HTTP threads must not query it while a job is running.
+    void cmm(size_t &used, size_t &total) const {
+        used = cmm_used_.load();
+        total = cmm_total_.load();
+    }
     // Stop accepting work; the running job finishes, queued jobs are cancelled.
     void shutdown();
 
@@ -62,6 +83,12 @@ private:
     std::map<const Job *, uint64_t> updates_;
     bool stop_ = false;
     int served_ = 0;
+    std::map<std::string, double> typical_s_;  // shape key -> duration of the last such job
+    double mean_s_ = 0;
+    int mean_n_ = 0;
+    std::shared_ptr<Job> running_;
+    std::atomic<size_t> cmm_used_{0}, cmm_total_{0};
+    void sample_cmm();
     uint64_t next_id_ = 1;
     std::thread thread_;
 };

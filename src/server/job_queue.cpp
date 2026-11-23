@@ -93,6 +93,42 @@ uint64_t JobQueue::wait_update(const std::shared_ptr<Job> &job, uint64_t seen, d
     return updates_[job.get()];
 }
 
+namespace {
+std::string shape_key(const Request &r) {
+    return std::string(task_name(r.task)) + "|" + std::to_string(r.width) + "x" + std::to_string(r.height) + "|" +
+           std::to_string(r.images.size()) + "|" + (r.loras.empty() ? "" : "lora");
+}
+}  // namespace
+
+std::vector<QueueEntry> JobQueue::snapshot() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<QueueEntry> out;
+    const double now = now_s();
+    double ahead = 0;
+    auto add = [&](const Job &j, bool running) {
+        QueueEntry e;
+        e.id = j.id;
+        e.task = task_name(j.request.task);
+        e.stage = j.stage;
+        e.running = running;
+        e.width = j.request.width;
+        e.height = j.request.height;
+        e.step = j.step;
+        e.total = j.total;
+        e.waited_s = now - j.created;
+        e.elapsed_s = running ? now - j.started : 0;
+        auto it = typical_s_.find(shape_key(j.request));
+        e.expect_s = it != typical_s_.end() ? it->second : mean_s_;
+        e.start_in_s = running ? 0 : ahead;
+        // A running job that has outlived its estimate is assumed to need a little longer, never zero.
+        ahead += running ? std::max(1.0, e.expect_s - e.elapsed_s) : e.expect_s;
+        out.push_back(std::move(e));
+    };
+    if (running_) add(*running_, true);
+    for (auto &j : queue_) add(*j, false);
+    return out;
+}
+
 size_t JobQueue::pending() const {
     std::lock_guard<std::mutex> lk(mu_);
     return queue_.size();
@@ -113,8 +149,19 @@ void JobQueue::shutdown() {
     done_cv_.notify_all();
 }
 
+void JobQueue::sample_cmm() {
+    try {
+        size_t used = 0, total = 0;
+        model_.runtime().cmm(used, total);
+        cmm_used_ = used;
+        cmm_total_ = total;
+    } catch (const std::exception &) {
+    }
+}
+
 void JobQueue::worker() {
     model_.runtime().bind_thread();  // this thread owns the NPU
+    sample_cmm();
     for (;;) {
         std::shared_ptr<Job> job;
         {
@@ -125,6 +172,7 @@ void JobQueue::worker() {
             queue_.pop_front();
             job->state = JobState::running;
             job->started = now_s();
+            running_ = job;
             ++updates_[job.get()];
             done_cv_.notify_all();
         }
@@ -139,12 +187,20 @@ void JobQueue::worker() {
             final_state = JobState::failed;
             error = e.what();
         }
+        sample_cmm();
         std::lock_guard<std::mutex> lk(mu_);
         job->result = std::move(result);
         job->state = final_state;
         job->error = error;
         job->finished = now_s();
-        if (final_state == JobState::done) ++served_;
+        running_.reset();
+        if (final_state == JobState::done) {
+            ++served_;
+            const double took = job->finished - job->started;
+            typical_s_[shape_key(job->request)] = took;
+            mean_s_ = (mean_s_ * mean_n_ + took) / (mean_n_ + 1);
+            ++mean_n_;
+        }
         ++updates_[job.get()];
         finished_order_.push_back(job->id);
         while (finished_order_.size() > keep_) {

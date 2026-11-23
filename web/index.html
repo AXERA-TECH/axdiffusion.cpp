@@ -250,7 +250,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 </aside>
 
 <main class="main">
-  <div class="bar"><span><i class="dot" id="dot"></i><span id="status">连接中</span></span><span id="served"></span><span id="mem"></span></div>
+  <div class="bar"><span><i class="dot" id="dot"></i><span id="status">连接中</span></span><span id="queue"></span><span id="served"></span><span id="mem"></span></div>
   <div class="stage" id="stage">
     <div class="frame" id="frame">
       <div class="empty" id="empty"><strong>还没有图</strong><span>在左边写一段描述，然后点“生成图片”</span></div>
@@ -514,7 +514,12 @@ function tick(){
   frac = done / sum;
   $('#bath').style.setProperty('--p', frac.toFixed(3));
   $('#pct').textContent = Math.round(frac * 100);
-  const name = P.queued ? '排队中，前面还有任务' : cur < 0 ? '准备中' : P.list[cur][1] + (P.stage === 'denoise' && P.total ? '，第 ' + Math.min(P.total, P.step + 1) + ' / ' + P.total + ' 步' : '');
+  let waitText = '排队中';
+  if (P.queued && Q.mine) {
+    const left = Math.max(0, Q.mine.wait - (now - Q.mine.at) / 1000);
+    waitText = '排队中，前面还有 ' + Q.mine.ahead + ' 张' + (Q.mine.known && Q.mine.wait > 0 ? '，大约 ' + secs(left) + '后开始' : '');
+  }
+  const name = P.queued ? waitText : cur < 0 ? '准备中' : P.list[cur][1] + (P.stage === 'denoise' && P.total ? '，第 ' + Math.min(P.total, P.step + 1) + ' / ' + P.total + ' 步' : '');
   $('#what').textContent = (P.of > 1 ? '第 ' + (P.idx + 1) + ' / ' + P.of + ' 张：' : '') + name;
   let left = '';
   if (!P.queued && P.est && P.est - elapsed > 1) left = '，大约还要 ' + secs(P.est - elapsed);
@@ -580,6 +585,20 @@ $('#asRef').onclick = async () => {
 $('#out').onclick = () => { const v = $('#viewer'); v.querySelector('img').src = $('#out').src; v.classList.remove('full'); v.classList.add('on'); };
 $('#viewer').onclick = e => { const v = $('#viewer'); if (e.target.tagName === 'IMG') v.classList.toggle('full'); else v.classList.remove('on'); };
 
+/* ---------- queue ---------- */
+const Q = {at: 0, mine: null};
+async function pollQueue(myId){
+  const now = performance.now(); if (now - Q.at < 900) return; Q.at = now;
+  try {
+    const q = await (await fetch('/v1/queue')).json();
+    const i = myId ? q.jobs.findIndex(x => x.id === myId) : -1;
+    Q.mine = i >= 0 ? {ahead: i, wait: q.jobs[i].start_in_s, known: q.jobs.slice(0, i).every(x => x.expect_s > 0), at: now} : null;
+    const run = q.jobs.find(x => x.running);
+    $('#queue').textContent = q.running + q.waiting === 0 ? '' : '队列：' + (run ? '正在生成 1 张' + (run.size ? '（' + run.size.replace('x', ' × ') + '）' : '') : '') + (q.waiting ? '，等待 ' + q.waiting + ' 张' : '');
+  } catch (e) { $('#queue').textContent = ''; }
+}
+setInterval(() => { if (!S.running || !P.queued) pollQueue(S.jobId); }, 3000);
+
 /* ---------- running jobs ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function runOne(body, idx, total){
@@ -595,6 +614,7 @@ async function runOne(body, idx, total){
     if (j.status === 'cancelled') throw Object.assign(new Error('cancelled'), {cancelled: true});
     if (j.status === 'failed') throw new Error(j.error || '生成失败');
     onJob(j);
+    if (j.status === 'queued') pollQueue(job.id);
   }
 }
 function explain(msg){

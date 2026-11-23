@@ -2,6 +2,7 @@
 //   POST   /v1/jobs              {task, prompt, width, height, seed, steps, loras, images:[base64], frames, fps}
 //   GET    /v1/jobs/{id}         status, progress; when done also images (base64 PNG) and timings
 //   GET    /v1/jobs/{id}/events  Server-Sent Events: one "progress" event per change, then "done"
+//   GET    /v1/queue             running and waiting jobs with time estimates (no prompts)
 //   DELETE /v1/jobs/{id}         cancel (queued jobs are dropped, a running job stops at the next step)
 #include <map>
 #include <mutex>
@@ -80,6 +81,26 @@ void register_jobs(httplib::Server &srv, ServerContext &ctx) {
         } catch (const std::exception &e) {
             json_error(res, 400, e.what());
         }
+    });
+    // GET /v1/queue -> {running, waiting, jobs:[{id, task, size, running, stage, progress, elapsed_s, expect_s, start_in_s}]}
+    // What is on the NPU and what waits behind it; prompts and images are not exposed.
+    srv.Get("/v1/queue", [&](const httplib::Request &, httplib::Response &res) {
+        nlohmann::json jobs = nlohmann::json::array();
+        int running = 0, waiting = 0;
+        for (auto &e : ctx.queue.snapshot()) {
+            (e.running ? running : waiting)++;
+            jobs.push_back({{"id", e.id},
+                            {"task", e.task},
+                            {"size", std::to_string(e.width) + "x" + std::to_string(e.height)},
+                            {"running", e.running},
+                            {"stage", e.stage},
+                            {"progress", {{"step", e.step}, {"total", e.total}}},
+                            {"waited_s", e.waited_s},
+                            {"elapsed_s", e.elapsed_s},
+                            {"expect_s", e.expect_s},
+                            {"start_in_s", e.start_in_s}});
+        }
+        res.set_content(nlohmann::json{{"running", running}, {"waiting", waiting}, {"jobs", jobs}}.dump(), "application/json");
     });
     // POST /v1/tokenize {prompt, width, height, references:[[w,h],...]} -> {tokens, limit, cut_chars}
     // Counts prompt tokens against what the model reads for that size; does not use the NPU.
