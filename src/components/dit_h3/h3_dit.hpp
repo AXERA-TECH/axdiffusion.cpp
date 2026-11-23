@@ -104,7 +104,8 @@ private:
     bool edit_ = false;                 // the prepared request is an edit
     int reference_rows_ = 0;
     std::vector<uint16_t> reference_proj_;  // [reference_rows,5376] bf16, projected once per request
-    std::map<int, Tiers> lora_block_;  // [rank][padded]
+    std::map<int, Tiers> lora_block_;       // [rank][padded]
+    std::map<int, Tiers> edit_lora_block_;  // [rank][padded], reference editing with a LoRA
     std::unique_ptr<Stream> stream_;  // block + final launches of a step are queued here
     std::map<int, std::unique_ptr<DitShape>> shapes_;
     std::map<int, std::unique_ptr<RefinerWs>> refiners_;

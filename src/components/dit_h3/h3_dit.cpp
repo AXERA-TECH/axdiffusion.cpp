@@ -72,9 +72,13 @@ Dit::Dit(const ModelDir &dir, const DitWeights &w) : w_(w) {
     load("dit-final", final_, false);
     // LoRA block kernels per rank tier: "dit-block-lora" is rank 64, "dit-block-lora-rN" is rank N.
     load("dit-block-lora", lora_block_[64], true);
-    for (int r : {32, 96, 128, 192, 256}) load("dit-block-lora-r" + std::to_string(r), lora_block_[r], true);
-    for (auto it = lora_block_.begin(); it != lora_block_.end();)
-        it = it->second.empty() ? lora_block_.erase(it) : std::next(it);
+    load("dit-block-edit-lora", edit_lora_block_[64], true);
+    for (int r : {32, 96, 128, 192, 256}) {
+        load("dit-block-lora-r" + std::to_string(r), lora_block_[r], true);
+        load("dit-block-edit-lora-r" + std::to_string(r), edit_lora_block_[r], true);
+    }
+    for (auto *m : {&lora_block_, &edit_lora_block_})
+        for (auto it = m->begin(); it != m->end();) it = it->second.empty() ? m->erase(it) : std::next(it);
     for (auto &kv : dir.tiers("dit-refiner", "")) {
         refiner_[kv.first].path = kv.second;
         refiner_[kv.first].granule = 512;
@@ -101,12 +105,11 @@ Model &Dit::Kernel::get() {
 }
 
 int Dit::pick_tier(int used, int lora_rank, bool edit) const {
-    const Tiers *cands = &block_;
-    if (edit) {
-        cands = &edit_block_;
-    } else if (lora_rank) {
-        auto it = lora_block_.find(lora_rank);
-        if (it == lora_block_.end()) return 0;
+    const Tiers *cands = edit ? &edit_block_ : &block_;
+    if (lora_rank) {
+        const auto &by_rank = edit ? edit_lora_block_ : lora_block_;
+        auto it = by_rank.find(lora_rank);
+        if (it == by_rank.end()) return 0;
         cands = &it->second;
     }
     const auto &finals = edit ? edit_final_ : final_;
@@ -205,14 +208,15 @@ void Dit::prepare(const std::vector<uint16_t> &text_hidden, int text_rows, int l
     used_ = text_rows + reference_rows_ + image_tokens_;
     if (edit) {
         if (!supports_edit()) fail("this model directory has no reference-edit DiT kernels");
-        if (lora) fail("LoRA is not supported together with reference editing yet");
         if (int(edit->text_tags.size()) != text_rows || int(edit->positions.size()) != used_)
             fail("edit layout does not match the sequence");
     }
-    if (lora && !lora_block_.count(lora->rank))
-        fail("no rank-" + std::to_string(lora->rank) + " LoRA block kernels in this model directory");
+    const auto &lora_tiers = edit ? edit_lora_block_ : lora_block_;
+    if (lora && !lora_tiers.count(lora->rank))
+        fail("no rank-" + std::to_string(lora->rank) + (edit ? " reference-edit" : "") +
+             " LoRA block kernels in this model directory");
     padded_ = pick_tier(used_, lora ? lora->rank : 0, edit != nullptr);
-    const auto &cands = edit ? edit_block_ : lora ? lora_block_.at(lora->rank) : block_;
+    const auto &cands = lora ? lora_tiers.at(lora->rank) : edit ? edit_block_ : block_;
     if (!padded_) {
         std::string have;
         for (auto &kv : cands) have += " " + std::to_string(kv.first);
@@ -397,7 +401,7 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
         in["sequence_bounds"] = s.bounds;
         Model *model = edit_ ? &edit_block_.at(padded_).get() : &block_.at(padded_).get();
         if (lora) {
-            model = &lora_block_.at(lora->rank).at(padded_).get();
+            model = &(edit_ ? edit_lora_block_ : lora_block_).at(lora->rank).at(padded_).get();
             const auto &ab = lora->block_ab[l];
             for (int k = 0; k < 8; ++k) in[kLoraInputs[k]] = ab[k];
         }

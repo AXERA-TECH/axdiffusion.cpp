@@ -207,7 +207,6 @@ public:
         if (!edit_ready()) fail("reference-image editing needs edit kernels that this model directory does not have");
         if (req.images.empty()) fail("edit needs at least one reference image");
         if (req.images.size() > 9) fail("at most 9 reference images");
-        if (!req.loras.empty()) fail("LoRA is not supported together with reference editing yet");
         check_size(req);
         if (req.prompt.empty()) fail("prompt is empty");
         const int steps = req.steps ? req.steps : kSteps;
@@ -224,6 +223,15 @@ public:
         }
         const int n_ref = int(req.images.size());
         TorchGenerator gen(req.seed);
+        const LoraSet *lora = nullptr;
+        if (!req.loras.empty()) {
+            if (!lora_) fail("LoRA requested but no LoRA directory was configured");
+            progress("lora");
+            double tl = now_s();
+            lora = &lora_->get(req.loras);
+            r.seconds["lora_build"] = now_s() - tl;
+            r.metrics["lora_rank"] = lora->rank;
+        }
 
         // 1) references -> VAE latents (posterior sample, fp16 rounding, normalization)
         progress("vae_encode");
@@ -324,7 +332,7 @@ public:
         de.positions = layout.position_ids;
         auto sample = patchify(noise, lat_h, lat_w);
         Dit::Timing dt;
-        dit_->run(hidden, text_rows, lat_h, lat_w, sample, steps, blocks, dt, nullptr, &progress, &de);
+        dit_->run(hidden, text_rows, lat_h, lat_w, sample, steps, blocks, dt, lora, &progress, &de);
         r.seconds["dit"] = dt.prepare + dt.steps;
         r.seconds["dit_prepare"] = dt.prepare;
         r.metrics["tokens"] = double(text_rows);
