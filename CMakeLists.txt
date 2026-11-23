@@ -10,6 +10,8 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fopenmp-simd")
 
 # AXCL runtime shipped with the board SDK. Override with -DAXCL_ROOT=/path/to/axcl
 set(AXCL_ROOT "/usr/local/axhelix" CACHE PATH "AXCL SDK root (contains include/ and lib/)")
+# Where libaxcl_rt.so lives on the board at run time (differs from AXCL_ROOT when cross-compiling).
+set(AXCL_RUNTIME_DIR "/usr/local/axhelix/lib" CACHE PATH "Directory of the AXCL libraries on the target")
 
 # The built-in web page is web/index.html, compiled in as a string. A running server can also read the page from
 # a directory (--web-dir), so the page can be edited without rebuilding.
@@ -32,11 +34,19 @@ target_include_directories(axdcore PUBLIC
   third_party ${AXCL_ROOT}/include)
 target_link_directories(axdcore PUBLIC ${AXCL_ROOT}/lib)
 target_link_libraries(axdcore PUBLIC axcl_rt pthread ${CMAKE_DL_LIBS})
+if(CMAKE_CROSSCOMPILING)
+  # libaxcl_rt.so depends on other SDK libraries that only need to resolve on the board.
+  target_link_options(axdcore PUBLIC -Wl,-rpath-link,${AXCL_ROOT}/lib -Wl,--allow-shlib-undefined)
+endif()
 
 foreach(tool axdiffusion-cli axdiffusion-server)
   string(REPLACE "-" "_" src ${tool})
   add_executable(${tool} tools/${src}.cpp)
   target_link_libraries(${tool} axdcore -static-libstdc++ -static-libgcc)
-  set_target_properties(${tool} PROPERTIES BUILD_RPATH "${AXCL_ROOT}/lib" INSTALL_RPATH "${AXCL_ROOT}/lib")
+  if(CMAKE_CROSSCOMPILING)
+    set_target_properties(${tool} PROPERTIES SKIP_BUILD_RPATH ON LINK_FLAGS "-Wl,-rpath,${AXCL_RUNTIME_DIR}")
+  else()
+    set_target_properties(${tool} PROPERTIES BUILD_RPATH "${AXCL_ROOT}/lib" INSTALL_RPATH "${AXCL_ROOT}/lib")
+  endif()
 endforeach()
 install(TARGETS axdiffusion-cli axdiffusion-server RUNTIME DESTINATION bin)
