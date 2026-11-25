@@ -93,6 +93,10 @@ public:
         i.max_prompt_tokens = std::min(text_->max_tokens(), dit_->max_text_rows(image_rows(1024, 1024)));
         i.max_references = edit_ready() ? 3 : 0;
         i.lora = lora_ != nullptr;
+        if (refine_ready()) {
+            i.refine_steps = {1, 2};
+            i.refine_min_pixels = kRefineMinPixels;
+        }
         return i;
     }
 
@@ -178,8 +182,77 @@ public:
         return dit_->supports_edit() && text_->supports_vision() && has_edit_kernels_;
     }
 
+    // Image (multiple of 32 pixels) -> VAE posterior moments [48, h/16, w/16] from 256 px tiles. Reference images
+    // use the official minimum overlap (64 px, blended). Refine re-noises the result, where tiles without overlap
+    // leave no visible seam and need about half the launches.
+    std::vector<float> encode_moments(const Image &vimg, int &lh, int &lw, int min_overlap = 64) {
+        int h = 0, w = 0;
+        auto px = edit::vae_pixels(vimg, h, w);  // [3,h,w]
+        std::vector<int> ys, yo, xs, xo;
+        edit::split_tiles(h, kVaeEncTile, min_overlap, 16, ys, yo);
+        edit::split_tiles(w, kVaeEncTile, min_overlap, 16, xs, xo);
+        std::vector<std::vector<float>> tiles;
+        for (int ty : ys)
+            for (int tx : xs) {
+                if (ty + kVaeEncTile > h || tx + kVaeEncTile > w) fail("image smaller than one VAE tile");
+                std::vector<float> t(size_t(3) * kVaeEncTile * kVaeEncTile);
+                for (int c = 0; c < 3; ++c)
+                    for (int y = 0; y < kVaeEncTile; ++y)
+                        std::copy_n(&px[(size_t(c) * h + ty + y) * w + tx], kVaeEncTile,
+                                    &t[(size_t(c) * kVaeEncTile + y) * kVaeEncTile]);
+                tiles.push_back(std::move(t));
+            }
+        auto moments_tiles = vae_enc_->encode_tiles(tiles);
+        for (auto &v : yo) v /= 16;
+        for (auto &v : xo) v /= 16;
+        lh = h / 16;
+        lw = w / 16;
+        return edit::stitch_tiles(moments_tiles, kVaeEncMoments, kVaeEncTileLatent, kVaeEncTileLatent, yo, xo, lh, lw);
+    }
+
+    // Two-pass refine: the base image is half the requested size (rounded to 32 px).
+    static constexpr long kRefineMinPixels = 3L * 1024 * 1024;
+    static int half32(int v) { return std::max(256, (v / 2 + 16) / 32 * 32); }
+    bool refine_ready() const { return has_edit_kernels_; }  // needs the VAE encoder
+
     Result run(const Request &req, Progress &progress) override {
+        if (req.refine_steps) {
+            if (req.task != Task::txt2img || !req.images.empty()) fail("refine_steps is for text-to-image only");
+            if (!refine_ready()) fail("refine needs the image-vae-encode kernel, which this model directory does not have");
+            if (req.refine_steps != 1 && req.refine_steps != 2) fail("refine_steps must be 0, 1 or 2");
+            check_size(req);
+            if (long(req.width) * req.height < kRefineMinPixels)
+                fail("refine_steps needs an output of at least 3 megapixels (for example 2048x1536); smaller images are "
+                     "generated directly");
+            Request base = req;
+            base.refine_steps = 0;
+            base.width = half32(req.width);
+            base.height = half32(req.height);
+            Result rb = run_txt2img(base, progress, Pass::base, nullptr, 0);
+            Request second = req;
+            second.refine_steps = 0;
+            second.steps = 0;  // the refine pass always ends on the last step
+            second.seed = req.seed + 1;  // fresh noise: the base image is already a function of the first draw
+            Result r = run_txt2img(second, progress, Pass::refine, &rb.images[0], req.refine_steps);
+            for (auto &kv : rb.seconds) r.seconds["base_" + kv.first] = kv.second;
+            r.seconds["total"] += rb.seconds["total"];
+            r.metrics["base_width"] = base.width;
+            r.metrics["base_height"] = base.height;
+            r.metrics["refine_steps"] = req.refine_steps;
+            return r;
+        }
         if (req.task == Task::edit || !req.images.empty()) return run_edit(req, progress);
+        return run_txt2img(req, progress, Pass::single, nullptr, 0);
+    }
+
+    // Progress stages: a single pass reports text_encoder / denoise / vae. In a two-pass request the base pass
+    // reports text_encoder / denoise / base_vae and the refine pass refine_encode / refine / vae, so observers
+    // see every stage once and in order.
+    enum class Pass { single, base, refine };
+
+    // `init` (refine pass): the image to start from; it is resized to the request size, encoded, mixed with noise
+    // at the sigma of step 6 - refine_n, and only the last refine_n steps run.
+    Result run_txt2img(const Request &req, Progress &progress, Pass pass, const Image *init, int refine_n) {
         if (req.task != Task::txt2img) fail(std::string("task ") + task_name(req.task) + " is not supported by this model");
         check_size(req);
         if (req.prompt.empty()) fail("prompt is empty");
@@ -192,14 +265,14 @@ public:
         const LoraSet *lora = nullptr;
         if (!req.loras.empty()) {
             if (!lora_) fail("LoRA requested but no LoRA directory was configured");
-            progress("lora");
+            if (pass != Pass::refine) progress("lora");
             double tl = now_s();
             lora = &lora_->get(req.loras);
             r.seconds["lora_build"] = now_s() - tl;
             r.metrics["lora_rank"] = lora->rank;
         }
 
-        progress("text_encoder");
+        if (pass != Pass::refine) progress("text_encoder");
         double t0 = now_s();
         r.token_ids = tok_->encode(req.prompt);
         if (r.token_ids.empty()) fail("prompt produced no tokens");
@@ -219,10 +292,31 @@ public:
         const int lat_h = req.height / 16, lat_w = req.width / 16;
         TorchGenerator gen(req.seed);
         auto noise = gen.randn(size_t(kLatentChannels) * lat_h * lat_w);
+        int first_step = 0;
+        if (init) {  // refine: x = (1 - sigma) * x0 + sigma * noise
+            first_step = kSteps - refine_n;
+            progress("refine_encode");
+            t0 = now_s();
+            if (!vae_enc_) vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
+            Image src = *init;
+            if (src.width != req.width || src.height != req.height)
+                src = edit::resize_lanczos(src, req.width, req.height);
+            int lh = 0, lw = 0;
+            auto moments = encode_moments(src, lh, lw, 0);
+            std::vector<float> zero(size_t(kLatentChannels) * lh * lw, 0.f);  // posterior mean
+            auto x0 = edit::posterior_latent(moments, zero, lh, lw, latents_mean_.data(), latents_std_.data());
+            r.seconds["vae_encode"] = now_s() - t0;
+            if (x0.size() != noise.size()) fail("init latent size mismatch");
+            const float sg = kSigmas[first_step];
+            for (size_t i = 0; i < noise.size(); ++i) noise[i] = (1.0f - sg) * x0[i] + sg * noise[i];
+        }
         auto sample = patchify(noise, lat_h, lat_w);
 
         Dit::Timing dt;
-        dit_->run(hidden, int(r.token_ids.size()), lat_h, lat_w, sample, steps, blocks, dt, lora, &progress);
+        const char *stage = pass == Pass::refine ? "refine" : "denoise";
+        progress(stage, 0, steps - first_step);  // the stage is visible while its first step runs
+        dit_->run(hidden, int(r.token_ids.size()), lat_h, lat_w, sample, steps, blocks, dt, lora, &progress, nullptr,
+                  first_step, stage);
         r.seconds["dit"] = dt.prepare + dt.steps;
         r.seconds["dit_prepare"] = dt.prepare;
         // wall time per block (with async launches the per-launch host times only cover binding/submission)
@@ -233,7 +327,7 @@ public:
         auto latents = unpatchify(sample, lat_h, lat_w);
         dump(req.dump_dir, "latents.f32", latents);
 
-        progress("vae");
+        progress(pass == Pass::base ? "base_vae" : "vae");
         Image img;
         double vae_s = 0;
         img.rgb = vae_->decode(latents, lat_h, lat_w, vae_s);
@@ -259,7 +353,7 @@ public:
         if (!vit_) {
             progress("load_edit");
             vit_ = std::make_unique<VisionEncoder>(*dir_);
-            vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
+            if (!vae_enc_) vae_enc_ = std::make_unique<VaeEncoder>(*dir_);
             r.seconds["edit_load"] = now_s() - t_all;
             AXD_LOG("edit kernels (ViT, VAE encoder): %.1f s", r.seconds["edit_load"]);
         }
@@ -286,28 +380,8 @@ public:
             if (std::min(src.width, src.height) < 32) fail("reference image is too small");
             Image vimg = edit::resize_for_vae(src);
             vit_copies[k] = edit::resize_for_vit(src);
-            int h = 0, w = 0;
-            auto px = edit::vae_pixels(vimg, h, w);  // [3,h,w]
-            std::vector<int> ys, yo, xs, xo;
-            edit::split_tiles(h, kVaeEncTile, 64, 16, ys, yo);
-            edit::split_tiles(w, kVaeEncTile, 64, 16, xs, xo);
-            std::vector<std::vector<float>> tiles;
-            for (int ty : ys)
-                for (int tx : xs) {
-                    if (ty + kVaeEncTile > h || tx + kVaeEncTile > w) fail("reference smaller than one VAE tile");
-                    std::vector<float> t(size_t(3) * kVaeEncTile * kVaeEncTile);
-                    for (int c = 0; c < 3; ++c)
-                        for (int y = 0; y < kVaeEncTile; ++y)
-                            std::copy_n(&px[(size_t(c) * h + ty + y) * w + tx], kVaeEncTile,
-                                        &t[(size_t(c) * kVaeEncTile + y) * kVaeEncTile]);
-                    tiles.push_back(std::move(t));
-                }
-            auto moments_tiles = vae_enc_->encode_tiles(tiles);
-            for (auto &v : yo) v /= 16;
-            for (auto &v : xo) v /= 16;
-            const int lh = h / 16, lw = w / 16;
-            auto moments = edit::stitch_tiles(moments_tiles, kVaeEncMoments, kVaeEncTileLatent, kVaeEncTileLatent, yo,
-                                              xo, lh, lw);
+            int lh = 0, lw = 0;
+            auto moments = encode_moments(vimg, lh, lw);
             auto eps = gen.randn(size_t(kLatentChannels) * lh * lw);
             ref_latents[k] = edit::posterior_latent(moments, eps, lh, lw, latents_mean_.data(), latents_std_.data());
             ref_grids[k] = {lh, lw};

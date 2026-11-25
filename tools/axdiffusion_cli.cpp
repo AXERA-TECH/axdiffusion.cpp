@@ -1,6 +1,6 @@
 // axdiffusion-cli: run one request (or N repeats) from the command line.
 //   axdiffusion-cli --model DIR --prompt TEXT [--size N | WxH] [--seed N] [--out out.png]
-//                   [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]... [--repeat N] [--steps N]
+//                   [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]... [--repeat N] [--steps N] [--refine N]
 //                   [--blocks N] [--dump-dir DIR] [--quiet]
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +14,8 @@ static void usage() {
     std::fprintf(stderr,
                  "usage: axdiffusion-cli --model DIR --prompt TEXT [--size N|WxH]\n"
                  "                       [--seed N] [--out PNG] [--image REF]... [--lora-dir DIR] [--lora NAME[:SCALE]]...\n"
-                 "                       [--repeat N] [--steps N] [--blocks N] [--dump-dir DIR] [--quiet]\n");
+                 "                       [--repeat N] [--steps N] [--blocks N] [--dump-dir DIR] [--quiet]\n"
+                 "                       [--refine 1|2]   (two-pass: half-size image, then N steps at --size)\n");
 }
 
 int main(int argc, char **argv) {
@@ -48,6 +49,7 @@ int main(int argc, char **argv) {
         else if (a == "--out") out = next();
         else if (a == "--repeat") repeat = std::stoi(next());
         else if (a == "--steps") req.steps = std::stoi(next());
+        else if (a == "--refine") req.refine_steps = std::stoi(next());
         else if (a == "--blocks") req.blocks = std::stoi(next());
         else if (a == "--dump-dir") req.dump_dir = next();
         else if (a == "--quiet") axd::g_verbose = false;

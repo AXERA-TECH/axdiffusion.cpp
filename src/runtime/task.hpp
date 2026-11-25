@@ -46,6 +46,9 @@ struct Request {
     std::vector<Image> images;  // reference images / keyframes
     std::vector<Video> videos;  // reference videos
     std::vector<Audio> audios;  // reference audio
+    // Two-pass large image: generate at half the size, upscale, re-noise and run only the last N denoise steps
+    // at full size. 0 = off; models list what they accept in ModelInfo::refine_steps.
+    int refine_steps = 0;
     // debugging
     int blocks = 0;            // 0 = all transformer blocks
     std::string dump_dir;      // write intermediate tensors here

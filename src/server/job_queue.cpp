@@ -96,7 +96,7 @@ uint64_t JobQueue::wait_update(const std::shared_ptr<Job> &job, uint64_t seen, d
 namespace {
 std::string shape_key(const Request &r) {
     return std::string(task_name(r.task)) + "|" + std::to_string(r.width) + "x" + std::to_string(r.height) + "|" +
-           std::to_string(r.images.size()) + "|" + (r.loras.empty() ? "" : "lora");
+           std::to_string(r.images.size()) + "|" + (r.loras.empty() ? "" : "lora") + "|" + std::to_string(r.refine_steps);
 }
 }  // namespace
 

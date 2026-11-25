@@ -16,6 +16,7 @@
 | `response_format` | string | `b64_json` | `b64_json` 或 `url` |
 | `seed` | int | 随机 | 扩展字段；`n` > 1 时依次 +1 |
 | `steps` | int | 6 | 扩展字段，1–6 |
+| `refine_steps` | int | 0 | 扩展字段，大图加速：`1` 或 `2`，见下文；`0` 为直接出图 |
 | `loras` | array | `[]` | 扩展字段，`[{"name": "...", "scale": 1.0}]` |
 
 响应：
@@ -50,6 +51,7 @@
 | `seed` | `-1` 为随机 |
 | `batch_size`, `n_iter` | 乘积 ≤ 4 |
 | `steps`, `cfg_scale`, `sampler_name`, `negative_prompt` | 接受但忽略 |
+| `enable_hr`, `hr_scale`, `hr_second_pass_steps` | 大图加速：`width`×`height` 是第一遍的尺寸，输出为它的 2 倍（`hr_scale` 只接受 2）；`hr_second_pass_steps` 取 1（默认）或 2 |
 
 响应：`{"images": ["<base64 PNG>", ...], "parameters": {...}, "info": "<JSON 字符串>"}`。
 
@@ -59,7 +61,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/jobs` | 提交：`{task, prompt, width, height, seed, steps, loras, images:[base64]}`，返回 202 与任务对象 |
+| POST | `/v1/jobs` | 提交：`{task, prompt, width, height, seed, steps, refine_steps, loras, images:[base64]}`，返回 202 与任务对象 |
 | GET | `/v1/jobs/{id}` | 状态 `queued/running/succeeded/failed/cancelled`、阶段 `stage`、进度 `progress.step/total`；成功后带 `images`（base64 PNG）与 `info` |
 | GET | `/v1/jobs/{id}/events` | Server-Sent Events：每次进度变化一条 `progress`，结束时一条 `done` |
 | DELETE | `/v1/jobs/{id}` | 取消：排队中的直接移除，运行中的在下一步停止 |
@@ -67,7 +69,20 @@
 `task` 取值：`txt2img`、`edit`（带 `images` 时自动为 edit），以及视频任务（`txt2video` 等，视频模型提供时可用）。
 同一时刻只有一个任务在 NPU 上执行，其余排队；同步接口（OpenAI、A1111）内部也走同一个队列。
 
+## 大图加速（`refine_steps`）
+
+可选的两遍出图，只用于文生图，默认关闭。服务先按一半宽高（取 32 的倍数）出一张完整的图，放大到目标尺寸后
+编码回潜空间并加噪，再在目标尺寸上只跑最后 1 步或 2 步。
+
+- 输出需不小于 300 万像素（例如 2048×1536）；更小的尺寸直接出图更合适，会返回错误。
+- 构图与小图一致，细节比直接出图少一些。补 2 步细节更多、耗时更长，人像皮肤可能多出斑点。
+- AX8860 上 2048×2048：直接出图 27.3 s，补 1 步 19.8 s，补 2 步 23.8 s；4096×4096：167.4 s、88.6 s、114.4 s。
+- `GET /health` 的 `refine` 给出可用的步数与最小像素数：`{"steps": [1, 2], "min_pixels": 3145728}`；模型目录
+  没有 VAE 编码 kernel 时 `steps` 为空。
+- 任务阶段依次为 `text_encoder`、`denoise`、`base_vae`、`refine_encode`、`refine`、`vae`；结果 `info` 带
+  `refine_steps`，`info.seconds` 里 `base_*` 是第一遍各阶段耗时，`total` 为两遍合计。
+
 ## 其它
 
-- `GET /health`：`{"status", "model", "arch", "tasks", "sizes", "lora", "load_s", "requests", "queued", "cmm_used_gib"}`
+- `GET /health`：`{"status", "model", "arch", "tasks", "sizes", "lora", "refine", "max_references", "load_s", "requests", "queued", "cmm_used_gib"}`
 - `GET /files/<name>.png`：`response_format=url` 生成的图片

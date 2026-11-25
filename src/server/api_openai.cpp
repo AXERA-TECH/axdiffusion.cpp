@@ -1,5 +1,5 @@
 // OpenAI Images API: POST /v1/images/generations, POST /v1/images/edits (multipart), GET /v1/models.
-// Extensions: seed, steps, loras. Also GET /v1/loras and GET /files/<name>.png (response_format=url).
+// Extensions: seed, steps, refine_steps, loras. Also GET /v1/loras and GET /files/<name>.png (response_format=url).
 #include <ctime>
 #include <fstream>
 
@@ -55,6 +55,7 @@ void register_openai(httplib::Server &srv, ServerContext &ctx) {
             if (base.prompt.empty()) return json_error(res, 400, "prompt is required");
             parse_size(b.value("size", std::string("1024x1024")), base.width, base.height);
             base.steps = b.value("steps", 0);
+            base.refine_steps = b.value("refine_steps", 0);
             base.loras = loras_from_json(b.value("loras", nlohmann::json::array()));
             int n = b.value("n", 1);
             if (n < 1 || n > 4) return json_error(res, 400, "n must be 1..4");

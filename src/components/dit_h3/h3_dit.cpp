@@ -437,18 +437,19 @@ void Dit::step(std::vector<float> &sample, int si, int blocks, Timing &t, const 
 
 void Dit::run(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
               std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora, Progress *progress,
-              const DitEdit *edit) {
+              const DitEdit *edit, int first_step, const char *stage) {
     if (steps < 1 || steps > kSteps) fail("steps must be 1..6");
+    if (first_step < 0 || first_step >= steps) fail("first step out of range");
     if (blocks < 1 || blocks > kDitLayers) fail("blocks must be 1..50");
     double t0 = now_s();
     prepare(text_hidden, text_rows, latent_h, latent_w, lora, edit);
     t.prepare = now_s() - t0;
     t0 = now_s();
-    for (int i = 0; i < steps; ++i) {
+    for (int i = first_step; i < steps; ++i) {
         double s0 = now_s();
         if (progress && progress->cancel) throw Cancelled();
         step(sample, i, blocks, t, lora);
-        if (progress) (*progress)("denoise", i + 1, steps);
+        if (progress) (*progress)(stage, i + 1 - first_step, steps - first_step);
         t.step_seconds.push_back(now_s() - s0);
         AXD_LOG("step %d/%d %.2f s", i + 1, steps, t.step_seconds.back());
     }

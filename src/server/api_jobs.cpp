@@ -1,5 +1,5 @@
 // Asynchronous jobs (used by the web UI and by long tasks such as video):
-//   POST   /v1/jobs              {task, prompt, width, height, seed, steps, loras, images:[base64], frames, fps}
+//   POST   /v1/jobs              {task, prompt, width, height, seed, steps, refine_steps, loras, images:[base64], frames, fps}
 //   GET    /v1/jobs/{id}         status, progress; when done also images (base64 PNG) and timings
 //   GET    /v1/jobs/{id}/events  Server-Sent Events: one "progress" event per change, then "done"
 //   GET    /v1/queue             running and waiting jobs with time estimates (no prompts)
@@ -69,6 +69,7 @@ void register_jobs(httplib::Server &srv, ServerContext &ctx) {
             r.frames = b.value("frames", 1);
             r.fps = b.value("fps", 0.0f);
             r.steps = b.value("steps", 0);
+            r.refine_steps = b.value("refine_steps", 0);
             r.cfg = b.value("cfg", 0.0f);
             r.seed = resolve_seed(b.value("seed", int64_t(-1)));
             r.loras = loras_from_json(b.value("loras", nlohmann::json::array()));

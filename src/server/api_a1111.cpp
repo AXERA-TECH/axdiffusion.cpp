@@ -1,5 +1,6 @@
 // A1111 / SD WebUI API: txt2img, img2img (init_images = references), model/LoRA/option listings.
 // steps, cfg_scale, sampler_name and negative_prompt are accepted and ignored by distilled models.
+// enable_hr (hr_scale 2, hr_second_pass_steps 1 or 2) maps to the two-pass refine.
 #include "api.hpp"
 #include "common.hpp"
 
@@ -11,6 +12,13 @@ void run_a1111(ServerContext &ctx, const nlohmann::json &b, Request base, httpli
     if (base.prompt.empty()) return json_error(res, 400, "prompt is required");
     base.width = b.value("width", 1024);
     base.height = b.value("height", 1024);
+    if (b.value("enable_hr", false)) {  // hires fix: width x height is the first pass, the result is hr_scale times that
+        if (base.task != Task::txt2img) return json_error(res, 400, "enable_hr is for txt2img only");
+        if (b.value("hr_scale", 2.0) != 2.0) return json_error(res, 400, "hr_scale must be 2");
+        base.width *= 2;
+        base.height *= 2;
+        base.refine_steps = b.value("hr_second_pass_steps", 0) == 2 ? 2 : 1;
+    }
     int count = std::max(1, b.value("batch_size", 1)) * std::max(1, b.value("n_iter", 1));
     if (count > 4) return json_error(res, 400, "batch_size * n_iter must be <= 4");
     uint64_t s0 = resolve_seed(b.value("seed", int64_t(-1)));

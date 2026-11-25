@@ -26,6 +26,8 @@ struct ModelInfo {
     int max_prompt_tokens = 0;
     int max_references = 0;
     bool lora = false;
+    std::vector<int> refine_steps;          // accepted Request::refine_steps values other than 0 (empty: no refine)
+    long refine_min_pixels = 0;             // smallest width*height a refine request may ask for
 };
 
 // How much of a prompt the model will read for a given request shape.

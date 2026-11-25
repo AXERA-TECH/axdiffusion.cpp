@@ -37,6 +37,7 @@ void register_web(httplib::Server &srv, ServerContext &ctx) {
                                        {"tasks", tasks},
                                        {"sizes", sizes},
                                        {"lora", info.lora},
+                                       {"refine", {{"steps", info.refine_steps}, {"min_pixels", info.refine_min_pixels}}},
                                        {"max_references", info.max_references},
                                        {"load_s", ctx.model.load_seconds()},
                                        {"requests", ctx.queue.served()},

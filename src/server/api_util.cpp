@@ -129,6 +129,7 @@ nlohmann::json result_info(const Request &req, const Result &r) {
                         {"height", req.height},
                         {"size", std::to_string(req.width) + "x" + std::to_string(req.height)},
                         {"task", task_name(req.task)},
+                        {"refine_steps", req.refine_steps},
                         {"loras", loras},
                         {"truncated", r.truncated},
                         {"seconds", r.seconds},

@@ -221,6 +221,12 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
       </div>
     </div>
 
+    <div class="field" id="refineField" hidden>
+      <div class="name"><span>大图加速</span><span class="aux" id="refineAux"></span></div>
+      <div class="chips" id="refine"></div>
+      <div class="note">先画一张一半尺寸的图，放大后只补画最后几步。比直接出图快，构图和小图一致，细节比直接出图少一些。</div>
+    </div>
+
     <div class="field">
       <div class="name"><span>风格 LoRA</span><span class="aux" id="loraAux"></span></div>
       <div class="loras" id="loras"></div>
@@ -290,7 +296,8 @@ const store = {
 const S = {
   sizes: [], ratio: store.get('ratio', '1:1'), size: store.get('size', '1024x1024'),
   loras: store.get('loras', []), loraNames: [], refs: [], maxRefs: 3, canEdit: false,
-  n: 1, running: false, stop: false, jobId: null, shots: [], current: -1
+  n: 1, running: false, stop: false, jobId: null, shots: [], current: -1,
+  refine: store.get('refine', 0), refineSteps: [], refineMin: 0
 };
 const RATIOS = [['1:1', 1], ['4:3', 4 / 3], ['3:4', 3 / 4], ['3:2', 3 / 2], ['2:3', 2 / 3], ['16:9', 16 / 9], ['9:16', 9 / 16], ['21:9', 21 / 9], ['9:21', 9 / 21]];
 const ratioOf = (w, h) => RATIOS.reduce((best, r) => Math.abs(Math.log(w / h / r[1])) < Math.abs(Math.log(w / h / best[1])) ? r : best)[0];
@@ -329,8 +336,27 @@ function drawSizes(){
   const [w, h] = chosenSize();
   $('#sizeAux').textContent = (w * h / 1e6).toFixed(1) + ' 百万像素' + (S.ratio === 'custom' ? '，宽高取 32 的倍数' : '');
   store.set('ratio', S.ratio); store.set('size', S.size);
-  fitFrame(); showEta(); if (typeof T !== 'undefined') count();
+  drawRefine(); fitFrame(); showEta(); if (typeof T !== 'undefined') count();
 }
+/* two-pass refine: offered for large text-to-image sizes when the server supports it */
+function refineOn(){
+  const [w, h] = chosenSize();
+  return S.refineSteps.length && !S.refs.length && w * h >= S.refineMin && S.refineSteps.includes(S.refine) ? S.refine : 0;
+}
+function drawRefine(){
+  const [w, h] = chosenSize(), can = S.refineSteps.length > 0 && !S.refs.length && w * h >= S.refineMin;
+  $('#refineField').hidden = !can;
+  if (!can) return;
+  const opts = [[0, '直接出图'], ...S.refineSteps.map(n => [n, '补 ' + n + ' 步'])];
+  $('#refine').replaceChildren(...opts.map(([n, text]) => {
+    const b = el('button', {type: 'button', className: 'chip', textContent: text});
+    b.setAttribute('aria-pressed', refineOn() === n);
+    b.onclick = () => { S.refine = n; store.set('refine', n); drawRefine(); showEta(); };
+    return b;
+  }));
+  $('#refineAux').textContent = refineOn() ? '小图 ' + half32(w) + ' × ' + half32(h) + (refineOn() > 1 ? '，细节更多，人像皮肤可能偏花' : '') : '';
+}
+const half32 = v => Math.max(256, Math.floor((Math.floor(v / 2) + 16) / 32) * 32);
 function nearest(list){
   const [w, h] = S.size.split('x').map(Number), area = w * h;
   return list.reduce((b, v) => { const [a, c] = v.split('x').map(Number), [p, q] = b.split('x').map(Number);
@@ -392,7 +418,7 @@ function drawRefs(){
   $('#drop').hidden = !S.canEdit || S.refs.length >= S.maxRefs;
   drawIdeas(); if (typeof T !== 'undefined') count();
   $('#go').textContent = S.running ? '停止生成' : (S.refs.length ? '按描述改图' : '生成图片');
-  showEta();
+  drawRefine(); showEta();
 }
 $('#drop').onclick = () => $('#file').click();
 $('#drop').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#file').click(); } };
@@ -461,7 +487,7 @@ $('#cw').oninput = $('#ch').oninput = () => drawSizes();
 function say(text, calm){ const m = $('#msg'); m.textContent = text; m.classList.toggle('on', !!text); m.classList.toggle('calm', !!calm); }
 
 /* ---------- time estimate, learned from earlier runs on this browser ---------- */
-const estKey = () => { const [w, h] = chosenSize(); return (S.refs.length ? 'e' + S.refs.length : 't') + '|' + w + 'x' + h + '|' + (S.loras.length ? 'l' : ''); };
+const estKey = () => { const [w, h] = chosenSize(); return (S.refs.length ? 'e' + S.refs.length : 't') + '|' + w + 'x' + h + '|' + (S.loras.length ? 'l' : '') + (refineOn() ? '|r' + refineOn() : ''); };
 const estimate = () => store.get('est', {})[estKey()];
 function showEta(){
   if (S.running) return;
@@ -471,10 +497,15 @@ function showEta(){
 
 /* ---------- progress ---------- */
 const STAGES = [['lora', '准备 LoRA', 1], ['text_encoder', '读懂描述', .5], ['denoise', '绘制', 9], ['vae', '显影成图', 1.5]];
+const stagesFor = (hasLora, refine) => (refine
+  ? [['lora', '准备 LoRA', 1], ['text_encoder', '读懂描述', .3], ['denoise', '绘制小图', 6], ['base_vae', '小图显影', .7],
+     ['refine_encode', '放大', 5.5], ['refine', '补画细节', 4 * refine], ['vae', '显影成图', 3]]
+  : STAGES).filter(s => s[0] !== 'lora' || hasLora);
+const STEPPED = ['denoise', 'refine'];
 const P = {};
-function startProgress(hasLora, hasRef, idx, total){
+function startProgress(hasLora, hasRef, idx, total, refine){
   Object.assign(P, {t0: performance.now(), stage: '', step: 0, total: 0, stepAt: 0, stepDur: 0, stageAt: performance.now(), queued: true,
-    list: STAGES.filter(s => s[0] !== 'lora' || hasLora), idx, of: total, est: estimate()});
+    list: stagesFor(hasLora, refine), idx, of: total, est: estimate()});
   $('#segs').replaceChildren(...P.list.map(s => { const d = el('div', {className: 'seg'}, el('i')); d.style.setProperty('--w', s[2]); return d; }));
   $('#prog').classList.add('on'); $('#result').classList.remove('on'); say('');
   $('#bath').classList.add('on'); $('#out').hidden = true; $('#empty').hidden = true;
@@ -498,7 +529,7 @@ function tick(){
   P.list.forEach((s, i) => {
     let f = i < cur ? 1 : 0;
     if (i === cur) {
-      if (s[0] === 'denoise' && P.total) {
+      if (STEPPED.includes(s[0]) && P.total) {
         const guess = P.stepDur || (P.est ? P.est * 1000 * .8 / P.total : 0);
         const part = guess ? Math.min(.92, (now - P.stepAt) / guess) : 0;
         f = Math.min(1, (P.step + part) / P.total);
@@ -519,11 +550,11 @@ function tick(){
     const left = Math.max(0, Q.mine.wait - (now - Q.mine.at) / 1000);
     waitText = '排队中，前面还有 ' + Q.mine.ahead + ' 张' + (Q.mine.known && Q.mine.wait > 0 ? '，大约 ' + secs(left) + '后开始' : '');
   }
-  const name = P.queued ? waitText : cur < 0 ? '准备中' : P.list[cur][1] + (P.stage === 'denoise' && P.total ? '，第 ' + Math.min(P.total, P.step + 1) + ' / ' + P.total + ' 步' : '');
+  const name = P.queued ? waitText : cur < 0 ? '准备中' : P.list[cur][1] + (STEPPED.includes(P.stage) && P.total ? '，第 ' + Math.min(P.total, P.step + 1) + ' / ' + P.total + ' 步' : '');
   $('#what').textContent = (P.of > 1 ? '第 ' + (P.idx + 1) + ' / ' + P.of + ' 张：' : '') + name;
   let left = '';
   if (!P.queued && P.est && P.est - elapsed > 1) left = '，大约还要 ' + secs(P.est - elapsed);
-  else if (!P.queued && P.stage === 'denoise' && P.stepDur) left = '，大约还要 ' + secs((P.total - P.step) * P.stepDur / 1000 + 1);
+  else if (!P.queued && STEPPED.includes(P.stage) && P.stepDur) left = '，大约还要 ' + secs((P.total - P.step) * P.stepDur / 1000 + 1);
   $('#time').textContent = '已用 ' + secs(elapsed) + left;
   P.raf = requestAnimationFrame(tick);
 }
@@ -565,7 +596,7 @@ function show(i, fresh){
   fitFrame([inf.width, inf.height]); $('#dims').textContent = '';
   $('#rp').textContent = s.prompt;
   $('#rm').replaceChildren(...[inf.width + ' × ' + inf.height, '种子 ' + inf.seed, '用时 ' + secs(t.total || 0),
-    inf.task === 'edit' ? '改图' : '', ...s.loras.map(l => l.name + ' ' + l.scale.toFixed(2))].filter(Boolean).map(x => el('span', {textContent: x})));
+    inf.task === 'edit' ? '改图' : '', inf.refine_steps ? '大图加速，补 ' + inf.refine_steps + ' 步' : '', ...s.loras.map(l => l.name + ' ' + l.scale.toFixed(2))].filter(Boolean).map(x => el('span', {textContent: x})));
   $('#dl').href = s.url; $('#dl').download = 'axdiffusion_' + inf.seed + '_' + inf.width + 'x' + inf.height + '.png';
   $('#asRef').hidden = !S.canEdit;
   if (!S.running || fresh) $('#result').classList.add('on');
@@ -575,6 +606,7 @@ $('#reuse').onclick = () => {
   $('#prompt').value = s.prompt; count(); $('#seed').value = s.info.seed; setRand(false); store.set('seed', s.info.seed);
   const v = s.info.width + 'x' + s.info.height;
   if (S.sizes.includes(v)) { S.ratio = ratioOf(s.info.width, s.info.height); S.size = v; } else { S.ratio = 'custom'; $('#cw').value = s.info.width; $('#ch').value = s.info.height; }
+  S.refine = s.info.refine_steps || 0; store.set('refine', S.refine);
   S.loras = s.loras.map(l => ({...l})); drawLoras(); drawSizes();
 };
 $('#asRef').onclick = async () => {
@@ -602,7 +634,7 @@ setInterval(() => { if (!S.running || !P.queued) pollQueue(S.jobId); }, 3000);
 /* ---------- running jobs ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function runOne(body, idx, total){
-  startProgress(body.loras.length > 0, body.images.length > 0, idx, total);
+  startProgress(body.loras.length > 0, body.images.length > 0, idx, total, body.refine_steps || 0);
   const sub = await fetch('/v1/jobs', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const job = await sub.json();
   if (!sub.ok || !job.id) throw new Error(job.error && job.error.message || sub.statusText);
@@ -625,7 +657,7 @@ function explain(msg){
 async function generate(){
   const prompt = $('#prompt').value.trim();
   if (!prompt) { say('先写一段画面描述'); $('#prompt').focus(); return; }
-  const [w, h] = chosenSize(), loras = S.loras.map(l => ({...l})), images = S.refs.map(String), n = S.n, rand = $('#rand').getAttribute('aria-pressed') === 'true';
+  const [w, h] = chosenSize(), loras = S.loras.map(l => ({...l})), images = S.refs.map(String), n = S.n, rand = $('#rand').getAttribute('aria-pressed') === 'true', refine_steps = refineOn();
   const key = estKey(), base = parseInt($('#seed').value || '0');
   S.running = true; S.stop = false; $('#go').classList.add('stop'); $('#go').textContent = '停止生成'; $('#dot').className = 'dot busy'; $('#status').textContent = '生成中';
   $('#eta').textContent = '停止会在当前这一步结束后生效'; fitFrame([w, h]);
@@ -633,7 +665,7 @@ async function generate(){
   try {
     for (let i = 0; i < n && !S.stop; i++) {
       const seed = rand ? Math.floor(Math.random() * 4294967295) : base + i;
-      const j = await runOne({task: images.length ? 'edit' : 'txt2img', prompt, width: w, height: h, seed, loras, images}, i, n);
+      const j = await runOne({task: images.length ? 'edit' : 'txt2img', prompt, width: w, height: h, seed, loras, images, refine_steps}, i, n);
       const est = store.get('est', {}); est[key] = j.info.seconds.total; store.set('est', est);
       endProgress(); j.images.forEach(b => addShot(b, prompt, j.info, loras));
       if (i + 1 < n && !S.stop) await sleep(1200);
@@ -664,7 +696,8 @@ async function health(){
     const h = await (await fetch('/health')).json();
     $('#model').textContent = h.model || '';
     S.maxRefs = h.max_references || 3; S.canEdit = (h.tasks || []).includes('edit');
-    if ((h.sizes || []).join() !== S.sizes.join()) { S.sizes = h.sizes || []; drawSizes(); }
+    const rf = h.refine || {}; S.refineSteps = rf.steps || []; S.refineMin = rf.min_pixels || 0;
+    if ((h.sizes || []).join() !== S.sizes.join()) { S.sizes = h.sizes || []; drawSizes(); } else drawRefine();
     if (!S.running) { $('#dot').className = h.queued ? 'dot busy' : 'dot'; $('#status').textContent = h.queued ? '别处有 ' + h.queued + ' 个任务在排队' : '空闲，可以生成'; }
     $('#served').textContent = '累计出图 ' + h.requests + ' 张';
     $('#mem').textContent = 'NPU 内存 ' + h.cmm_used_gib.toFixed(1) + ' GiB';

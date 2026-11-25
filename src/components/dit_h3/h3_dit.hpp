@@ -64,9 +64,12 @@ public:
     };
     // Run the sampler. `sample` is [image_tokens,96] float32 noise (patchified) and is updated in place to the
     // final latent rows. `progress` (optional) receives one report per step and is checked for cancellation.
+    // `first_step` > 0 starts in the middle of the schedule (`sample` must already be at that step's sigma);
+    // `stage` is the name the step reports carry.
     void run(const std::vector<uint16_t> &text_hidden, int text_rows, int latent_h, int latent_w,
              std::vector<float> &sample, int steps, int blocks, Timing &t, const LoraSet *lora = nullptr,
-             Progress *progress = nullptr, const DitEdit *edit = nullptr);
+             Progress *progress = nullptr, const DitEdit *edit = nullptr, int first_step = 0,
+             const char *stage = "denoise");
     bool supports_edit() const { return !edit_block_.empty() && w_.adaln_edit != nullptr; }
     int max_edit_rows() const { return edit_block_.empty() ? 0 : edit_block_.rbegin()->first; }
     bool has_lora_kernel(int padded, int rank) const {
